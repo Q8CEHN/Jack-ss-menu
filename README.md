@@ -15,10 +15,12 @@ bash -c 'set -e; if ! command -v curl >/dev/null; then if command -v apt-get >/d
 以后登录服务器，输入：
 
 ```bash
-ss
+s-s
 ```
 
 本地运行源码也可以：`sudo bash ss.sh`。
+
+旧版本用户重新执行上面的一键命令，即可把菜单快捷命令更新为 `s-s`，保留原节点配置和密码。脚本只清理本项目创建的旧 `ss` 菜单文件。
 
 ## 中文菜单
 
@@ -46,7 +48,7 @@ ss
 - 不关闭或清空防火墙。对正在运行的 UFW / firewalld 添加端口规则，并记录新增规则供卸载清理；其他防火墙需自行放行。
 - **阿里云等云服务器必须另在控制台安全组放行节点端口的 TCP 和 UDP。** 公网 IP 自动检测失败时手动填写公网地址，不能填写阿里云内网地址。
 - IPv6 被系统完全禁用时，`::` 监听可能不可用，应先检查系统网络设置。
-- 安装后 `ss -ntlp`、`ss -V` 等带参数用法会转发给系统原有的 iproute2 `ss`。
+- 菜单快捷命令为 `s-s`，系统原有的 `ss -ntlp` 等网络诊断命令照常使用。
 - 卸载输入 `YES` 确认后执行；云安全组规则仍需在云控制台删除。
 
 ## 检查
@@ -57,6 +59,6 @@ bash ss.sh --version
 bash ss.sh --help
 ```
 
-已使用官方 sing-box 进行配置检查，并检查分享链接、文件权限和系统 ss 命令转发。本地 SOCKS → Shadowsocks → HTTP 测试因执行环境禁止创建 netlink socket 而无法启动；**实际网络连通性、systemd 服务和各发行版防火墙尚需在目标服务器核验**。
+已使用官方 sing-box 进行配置检查，并检查分享链接、文件权限及快捷命令迁移。本地 SOCKS → Shadowsocks → HTTP 测试因执行环境禁止创建 netlink socket 而无法启动；**实际网络连通性、systemd 服务和各发行版防火墙尚需在目标服务器核验**。
 
 官方资料：[Shadowsocks 入站](https://sing-box.sagernet.org/configuration/inbound/shadowsocks/) · [sing-box Releases](https://github.com/SagerNet/sing-box/releases)

@@ -5,13 +5,21 @@ umask 077
 ROOT=/etc/jack-ss
 BIN=/opt/jack-ss/sing-box
 UNIT=/etc/systemd/system/jack-ss.service
-MENU=/usr/local/bin/ss
-VERSION=1.0.0
+MENU=/usr/local/bin/s-s
+LEGACY_MENU=/usr/local/bin/ss
+VERSION=1.0.1
 TMP=''
 trap '[[ -z "$TMP" ]] || rm -rf -- "$TMP"' EXIT
 die() { echo "错误：$*" >&2; exit 1; }
 ask() { read -r -p "$1" "$2" </dev/tty; }
 root_check() { [[ $EUID -eq 0 ]] || die '请使用 root 或 sudo bash ss.sh。'; }
+install_menu() {
+  if [[ -e "$MENU" ]] && ! grep -q 'JACK_SS_MENU' "$MENU"; then die "$MENU 已有其他程序，停止覆盖。"; fi
+  if [[ $(readlink -f "${BASH_SOURCE[0]}") != "$(readlink -f "$MENU")" ]]; then
+    install -m 755 "${BASH_SOURCE[0]}" "$MENU"
+  fi
+  if [[ -f "$LEGACY_MENU" ]] && grep -q 'JACK_SS_MENU' "$LEGACY_MENU"; then rm -f "$LEGACY_MENU"; fi
+}
 deps() {
   command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] || die '需要使用 systemd 的 Linux。'
   local missing=0 c
@@ -151,7 +159,7 @@ firewall_remove() {
 install_node() {
   if [[ -f "$ROOT/config.json" ]]; then echo '已安装，保留现有节点资料。'; node_info; return; fi
   deps; input_port; public_host
-  if [[ -e "$MENU" ]] && ! grep -q 'JACK_SS_MENU' "$MENU"; then die '/usr/local/bin/ss 已有其他程序，停止覆盖。'; fi
+  if [[ -e "$MENU" ]] && ! grep -q 'JACK_SS_MENU' "$MENU"; then die "$MENU 已有其他程序，停止覆盖。"; fi
   install -d -m 700 "$ROOT"
   download_core; write_config
   printf '%s\n' "$HOST" >"$ROOT/host"
@@ -172,9 +180,7 @@ ProtectSystem=strict
 [Install]
 WantedBy=multi-user.target
 UNIT
-  if [[ $(readlink -f "${BASH_SOURCE[0]}") != "$(readlink -f "$MENU")" ]]; then
-    install -m 755 "${BASH_SOURCE[0]}" "$MENU"
-  fi
+  install_menu
   systemctl daemon-reload; systemctl enable --now jack-ss
   sleep 1; systemctl is-active --quiet jack-ss || die '启动失败，请查看 journalctl -u jack-ss。'
   firewall_add "$PORT"
@@ -227,20 +233,19 @@ uninstall_node() {
   rm -f "$UNIT"
   rm -rf -- "$ROOT" /opt/jack-ss
   if [[ -f "$MENU" ]] && grep -q 'JACK_SS_MENU' "$MENU"; then rm -f "$MENU"; fi
+  if [[ -f "$LEGACY_MENU" ]] && grep -q 'JACK_SS_MENU' "$LEGACY_MENU"; then rm -f "$LEGACY_MENU"; fi
   systemctl daemon-reload; systemctl reset-failed jack-ss 2>/dev/null || true
   echo '已卸载；云安全组规则请自行删除。原有 sing-box、哪吒、SSH 和其他服务不受影响。'
   exit 0
 }
 main() {
-  # Keep native iproute2 ss options working after installing the short command.
   if (( $# )); then
-    case "$1" in --menu) shift;; --version) echo "$VERSION"; return;; --help) echo 'bash ss.sh：打开中文菜单；ss -ntlp 等参数转发系统 ss。'; return;;
-      *) for native in /usr/bin/ss /usr/sbin/ss /bin/ss /sbin/ss; do
-           [[ ! -x "$native" ]] || exec "$native" "$@"
-         done; die '未找到系统 ss 命令。';;
+    case "$1" in --menu) shift;; --version) echo "$VERSION"; return;; --help) echo 's-s：打开中文菜单；--version：查看版本；--help：查看帮助。'; return;;
+      *) die "未知参数：$1。使用 s-s --help 查看帮助。";;
     esac
   fi
   root_check
+  if [[ -f "$ROOT/config.json" ]]; then install_menu; fi
   while true; do
     echo; echo "====== Jack SS 中文管理 $VERSION ======"
     if [[ -f "$ROOT/config.json" ]]; then systemctl is-active jack-ss || true; else echo '尚未安装本菜单的节点'; fi

@@ -2,13 +2,20 @@
 # JACK_SS_MENU — lightweight Shadowsocks manager.
 set -Eeuo pipefail
 umask 077
-VERSION=2.0.2
+VERSION=2.0.3
 ROOT=/etc/jack-ss
 MENU=/usr/local/bin/s-s
 UNIT=/etc/systemd/system/jack-ss.service
+INIT=/etc/init.d/jack-ss
+CORE_DIR=/opt/jack-ss
+LEGACY_MENU=/usr/local/bin/ss
+POLICY_FILE=/usr/sbin/policy-rc.d
+VENDOR_CONFIG=/etc/shadowsocks-libev
+SYSTEMD_DIR=/etc/systemd/system
+INIT_DIR=/etc/init.d
 POLICY_OWN=0
 cleanup() {
-  if (( POLICY_OWN )) && [[ -f /usr/sbin/policy-rc.d ]] && grep -q JACK_SS_PACKAGE_GUARD /usr/sbin/policy-rc.d; then rm -f /usr/sbin/policy-rc.d; fi
+  if (( POLICY_OWN )) && [[ -f "$POLICY_FILE" ]] && grep -q JACK_SS_PACKAGE_GUARD "$POLICY_FILE"; then rm -f "$POLICY_FILE"; fi
 }
 trap cleanup EXIT
 fail() { echo "错误：$*" >&2; exit 1; }
@@ -26,23 +33,42 @@ check_space() {
   [[ "$available" =~ ^[0-9]+$ ]] || return 0
   (( available >= 4096 )) || fail '/usr 可用空间不足 4 MB，请先释放空间。'
 }
+record_packages_after() {
+  [[ -f "$ROOT/packages.before" ]] || return 0
+  dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | sort -u >"$ROOT/packages.after"
+  comm -13 "$ROOT/packages.before" "$ROOT/packages.after" >>"$ROOT/packages.owned"
+  sort -u "$ROOT/packages.owned" -o "$ROOT/packages.owned"
+  rm -f "$ROOT/packages.before" "$ROOT/packages.after"
+}
 install_core() {
-  if command -v ss-server >/dev/null; then return; fi
+  if command -v ss-server >/dev/null; then
+    if [[ ! -f "$ROOT/core-origin" ]]; then
+      if [[ -f "$ROOT/settings" || -f "$ROOT/config.json" ]]; then
+        printf 'legacy\n' >"$ROOT/core-origin"
+      else install -d -m 700 "$ROOT"; printf 'shared\n' >"$ROOT/core-origin"; fi
+    fi
+    record_packages_after
+    return
+  fi
   check_space
+  install -d -m 700 "$ROOT"
+  printf 'owned\n' >"$ROOT/core-origin"
   if command -v apt-get >/dev/null; then
     # Prevent a newly installed package from starting its example server.
-    if [[ ! -e /usr/sbin/policy-rc.d ]]; then
-      cat >/usr/sbin/policy-rc.d <<'POLICY'
+    if [[ ! -e "$POLICY_FILE" ]]; then
+      cat >"$POLICY_FILE" <<'POLICY'
 #!/bin/sh
 # JACK_SS_PACKAGE_GUARD
 case "$1" in shadowsocks-libev*) exit 101;; *) exit 0;; esac
 POLICY
-      chmod 755 /usr/sbin/policy-rc.d; POLICY_OWN=1
+      chmod 755 "$POLICY_FILE"; POLICY_OWN=1
     fi
     if ! apt-cache show shadowsocks-libev >/dev/null 2>&1; then
       apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true update
     fi
+    dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | sort -u >"$ROOT/packages.before"
     DEBIAN_FRONTEND=noninteractive apt-get -o APT::Keep-Downloaded-Packages=false install -y --no-install-recommends shadowsocks-libev
+    record_packages_after
     cleanup; POLICY_OWN=0
     if is_systemd; then systemctl disable --now shadowsocks-libev.service >/dev/null 2>&1 || true
     elif command -v update-rc.d >/dev/null; then update-rc.d shadowsocks-libev disable >/dev/null 2>&1 || true; fi
@@ -322,32 +348,123 @@ update_core() {
   restart_service; sleep 1; healthy || fail '更新后启动失败。'
   echo '更新完成'
 }
+core_is_shared() {
+  local exe target config origin=''
+  [[ ! -r "$ROOT/core-origin" ]] || read -r origin <"$ROOT/core-origin"
+  [[ "$origin" != shared ]] || return 0
+  for exe in /proc/[0-9]*/exe; do
+    target=$(readlink "$exe" 2>/dev/null || true)
+    case "$target" in */ss-server|*/ss-server\ \(deleted\)|*/ss-local|*/ss-tunnel|*/ss-redir|*/ss-manager) return 0;; esac
+  done
+  # The package's generated loopback-only example is not another user node.
+  if [[ -d "$VENDOR_CONFIG" ]]; then
+    while IFS= read -r config; do
+      if [[ "$config" != "$VENDOR_CONFIG/config.json" ]] ||
+         ! tr -d '[:space:]' <"$config" | grep -Fq '"server":["::1","127.0.0.1"]'; then return 0; fi
+    done < <(find "$VENDOR_CONFIG" -type f -name '*.json')
+  fi
+  while IFS= read -r config; do
+    target=$(readlink -f "$config" 2>/dev/null || true)
+    [[ "$target" != "$(readlink -f "$UNIT")" && "$target" != "$(readlink -f "$INIT")" ]] || continue
+    [[ "$config" != "$INIT_DIR/shadowsocks-libev" ]] || continue
+    return 0
+  done < <(grep -RlE '(ss-server|ss-local|ss-tunnel|ss-redir|ss-manager)' "$SYSTEMD_DIR" "$INIT_DIR" 2>/dev/null || true)
+  return 1
+}
+apt_purge_checked() {
+  local plan action name rest requested allowed
+  (( $# )) || return 0
+  plan=$(LC_ALL=C apt-get -s purge -- "$@") || return 1
+  while read -r action name rest; do
+    if [[ "$action" == Inst ]]; then echo '保留软件包：卸载会触发其他软件变更。' >&2; return 2; fi
+    [[ "$action" == Remv || "$action" == Purg ]] || continue
+    allowed=0
+    for requested in "$@"; do
+      [[ "${name%%:*}" != "${requested%%:*}" ]] || allowed=1
+    done
+    if (( ! allowed )); then echo "保留软件包：其他软件依赖 $name。" >&2; return 2; fi
+  done <<<"$plan"
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -- "$@"
+}
+remove_core() {
+  if core_is_shared; then echo '保留共享内核。'; return 0; fi
+  if command -v apt-get >/dev/null; then
+    local result=0 plan action name rest
+    local -a candidates=() orphaned=()
+    if [[ -f "$ROOT/packages.owned" ]]; then
+      mapfile -t candidates <"$ROOT/packages.owned"
+    else
+      # Old versions did not track installations. Only consider package-manager
+      # auto-removable libev dependencies; never invoke global autoremove.
+      candidates=(libbloom2 libcork16 libcorkipset1 libjsonparser1.1 libev4 libev4t64 libcares2 libmbedcrypto7 libmbedcrypto16)
+    fi
+    if dpkg-query -W -f='${db:Status-Abbrev}' shadowsocks-libev 2>/dev/null | grep -Eq '^(ii|rc)'; then
+      apt_purge_checked shadowsocks-libev || result=$?
+      (( result != 2 )) || return 0
+      (( result == 0 )) || return "$result"
+    fi
+    plan=$(LC_ALL=C apt-get -s autoremove) || return 1
+    local candidate
+    while read -r action name rest; do
+      [[ "$action" == Remv || "$action" == Purg ]] || continue
+      for candidate in "${candidates[@]}"; do
+        if [[ "${name%%:*}" == "${candidate%%:*}" ]]; then orphaned+=("$name"); break; fi
+      done
+    done <<<"$plan"
+    apt_purge_checked "${orphaned[@]}" || result=$?
+    (( result != 2 )) || return 0
+    return "$result"
+  elif command -v apk >/dev/null; then
+    if apk info -r shadowsocks-libev 2>/dev/null | tail -n +2 | grep -q '[^[:space:]]'; then echo '保留共享内核。'; return 0; fi
+    if apk info -e shadowsocks-libev >/dev/null 2>&1; then apk del shadowsocks-libev || return 1; fi
+  elif command -v rpm >/dev/null && rpm -q shadowsocks-libev >/dev/null 2>&1; then
+    if rpm -q --whatrequires shadowsocks-libev >/dev/null 2>&1; then echo '保留共享内核。'; return 0; fi
+    if command -v dnf >/dev/null; then dnf remove -y --setopt=clean_requirements_on_remove=True shadowsocks-libev || return 1
+    elif command -v yum >/dev/null; then yum remove -y --setopt=clean_requirements_on_remove=1 shadowsocks-libev || return 1; fi
+  fi
+  return 0
+}
 uninstall_node() {
   local answer
-  ask '卸载节点和菜单？输入 YES：' answer
+  ask '彻底卸载？输入 YES：' answer
   [[ "$answer" == YES ]] || return 0
-  stop_service || true; firewall_remove
-  if is_systemd; then systemctl disable jack-ss >/dev/null 2>&1 || true; rm -f "$UNIT"; systemctl daemon-reload; fi
-  if [[ -f /etc/init.d/jack-ss ]] && grep -q JACK_SS_MENU /etc/init.d/jack-ss; then
+  stop_service || true
+  if healthy; then fail '服务仍在运行，卸载未完成。'; fi
+  firewall_remove
+  remove_core || fail '软件包清理失败，保留配置以便重试。'
+  if is_systemd; then systemctl disable jack-ss >/dev/null 2>&1 || true; fi
+  rm -f "$UNIT"
+  if [[ -f "$INIT" ]] && grep -q JACK_SS_MENU "$INIT"; then
     if command -v rc-update >/dev/null; then rc-update del jack-ss default || true
     elif command -v update-rc.d >/dev/null; then update-rc.d -f jack-ss remove; fi
-    rm -f /etc/init.d/jack-ss
+    rm -f "$INIT"
   fi
-  rm -rf -- "$ROOT"
+  if [[ -d "$(dirname "$UNIT")" ]]; then
+    find "$(dirname "$UNIT")" -mindepth 2 -maxdepth 2 -type l -name jack-ss.service -delete
+  fi
+  rm -rf -- "$CORE_DIR" "$ROOT"
   if [[ -f "$MENU" ]] && grep -q JACK_SS_MENU "$MENU"; then rm -f "$MENU"; fi
+  if [[ -f "$LEGACY_MENU" ]] && grep -q JACK_SS_MENU "$LEGACY_MENU"; then rm -f "$LEGACY_MENU"; fi
+  if [[ -f "$POLICY_FILE" ]] && grep -q JACK_SS_PACKAGE_GUARD "$POLICY_FILE"; then rm -f "$POLICY_FILE"; fi
+  if is_systemd; then
+    systemctl daemon-reload
+    systemctl reset-failed jack-ss >/dev/null 2>&1 || true
+  fi
+  if [[ -e "$ROOT" || -e "$CORE_DIR" || -e "$UNIT" ]]; then fail '仍有文件未删除，卸载未完成。'; fi
   echo '卸载完成'; exit 0
 }
 main() {
-  case "${1:-}" in --version) echo "$VERSION"; return;; --help) echo 's-s：中文菜单；--start / --stop / --restart：管理服务。'; return;; esac
+  case "${1:-}" in --version) echo "$VERSION"; return;; --help) echo 's-s：中文菜单；--start / --stop / --restart：管理服务；--uninstall：彻底卸载。'; return;; esac
   root_check
   case "${1:-}" in
     --start) load_state; start_service; return;; --stop) stop_service; return;; --restart) load_state; restart_service; return;;
+    --uninstall) uninstall_node; return;;
     ''|--menu) ;; *) fail "未知参数：$1";;
   esac
   install_menu
   while true; do
     printf '\n===== Jack SS 轻量版 %s =====\n' "$VERSION"
-    printf '%s\n' '1. 安装 / 迁移' '2. 查看节点' '3. 修改端口' '4. 修改密码' '5. 启动' '6. 停止' '7. 重启' '8. 查看日志' '9. 更新内核' '10. 修改公网地址' '11. 卸载' '12. TCP / UDP 设置' '0. 退出'
+    printf '%s\n' '1. 安装 / 迁移' '2. 查看节点' '3. 修改端口' '4. 修改密码' '5. 启动' '6. 停止' '7. 重启' '8. 查看日志' '9. 更新内核' '10. 修改公网地址' '11. 彻底卸载' '12. TCP / UDP 设置' '0. 退出'
     ask '请选择：' choice
     case "$choice" in
       1) install_node;; 2) node_info;; 3) change_settings ports;; 4) change_settings password;;

@@ -12,10 +12,10 @@
 root 登录后复制整行：
 
 ```sh
-sh -c 'set -e; if ! command -v bash >/dev/null || ! command -v curl >/dev/null; then if command -v apt-get >/dev/null; then apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true update && apt-get install -y --no-install-recommends bash curl ca-certificates; elif command -v apk >/dev/null; then apk add --no-cache bash curl ca-certificates; elif command -v dnf >/dev/null; then dnf install -y bash curl ca-certificates; elif command -v yum >/dev/null; then yum install -y bash curl ca-certificates; else exit 1; fi; fi; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; curl -fLSs --retry 2 "https://raw.githubusercontent.com/Q8CEHN/Jack-ss-menu/main/ss.sh?v=2.0.2" -o "$f"; bash "$f"'
+sh -c 'set -e; if ! command -v bash >/dev/null || ! command -v curl >/dev/null; then if command -v apt-get >/dev/null; then apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true update && apt-get install -y --no-install-recommends bash curl ca-certificates; elif command -v apk >/dev/null; then apk add --no-cache bash curl ca-certificates; elif command -v dnf >/dev/null; then dnf install -y bash curl ca-certificates; elif command -v yum >/dev/null; then yum install -y bash curl ca-certificates; else exit 1; fi; fi; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; curl -fLSs --retry 2 "https://raw.githubusercontent.com/Q8CEHN/Jack-ss-menu/main/ss.sh?v=2.0.3" -o "$f"; bash "$f"'
 ```
 
-看到 **2.0.2** 后，选择 **1. 安装 / 迁移**。
+看到 **2.0.3** 后，选择 **1. 安装 / 迁移**。
 
 以后打开菜单：
 
@@ -39,7 +39,7 @@ s-s
 | 5 / 6 / 7 | 启动 / 停止 / 重启 |
 | 8 / 9 | 查看日志 / 更新内核 |
 | 10 | 修改公网地址 |
-| 11 | 卸载节点和菜单 |
+| 11 | 彻底卸载 |
 | 12 | TCP / UDP 设置 |
 
 ## 支持与升级
@@ -48,8 +48,16 @@ s-s
 - 支持 systemd、OpenRC 和 Debian SysV 开机启动。其他初始化环境可用 `s-s --start`，需自行添加启动任务。
 - 密码和配置在 `/etc/jack-ss/`，仅 root 可读；资料在 `/etc/jack-ss/node.txt`。
 - 原 1.x 用户重新执行安装命令，选择 1 迁移，保留本项目的端口、密码和加密方式；确认新服务运行后删除本项目旧的大内核。失败时恢复旧配置和服务。
-- 新版卸载只删除本项目节点、菜单和新增防火墙规则，保留系统共享的软件包和依赖。
+- 卸载会删除节点、密码、迁移备份、旧私有内核、服务、自启链接、新旧菜单命令和本项目防火墙规则，同时移除未共享的 shadowsocks-libev 软件包。新安装会记录新增依赖，仅清理其中已无软件依赖的包；旧版使用受限的 libev 依赖名单。已有共享内核、其他节点及其他软件仍在使用的依赖会保留。
 - 防火墙自动处理限运行中的 UFW / firewalld，其他规则需自行设置。
+
+## 彻底卸载
+
+菜单选择 **11**，输入 `YES`。旧菜单已被删除时，也可直接下载新版执行卸载：
+
+```bash
+f=$(mktemp); curl -fLSs 'https://raw.githubusercontent.com/Q8CEHN/Jack-ss-menu/main/ss.sh?v=2.0.3' -o "$f" && bash "$f" --uninstall; rm -f "$f"; hash -r
+```
 
 ## 已验证
 

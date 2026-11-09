@@ -2,7 +2,7 @@
 # JACK_SS_MENU — lightweight Shadowsocks manager.
 set -Eeuo pipefail
 umask 077
-VERSION=2.0.1
+VERSION=2.0.2
 ROOT=/etc/jack-ss
 MENU=/usr/local/bin/s-s
 UNIT=/etc/systemd/system/jack-ss.service
@@ -194,7 +194,9 @@ node_info() {
   [[ "$address" != *:* ]] || address="[$address]"
   token=$(printf '%s:%s' "$METHOD" "$PASSWORD" | base64 | tr '/+' '_-' | tr -d '=\n')
   {
-    printf '公网：%s:%s\n本机端口：%s\n协议：%s\n加密：%s\n密码：%s\n\n' "$HOST" "$PUBLIC_PORT" "$LOCAL_PORT" "$protocol" "$METHOD" "$PASSWORD"
+    printf '服务器：%s\n端口：%s\n' "$HOST" "$PUBLIC_PORT"
+    if [[ "$LOCAL_PORT" != "$PUBLIC_PORT" ]]; then printf '本机端口：%s\n' "$LOCAL_PORT"; fi
+    printf '协议：%s\n加密：%s\n密码：%s\n\n' "$protocol" "$METHOD" "$PASSWORD"
     printf 'ss://%s@%s:%s#Jack-SS\n' "$token" "$address" "$PUBLIC_PORT"
   } | tee "$ROOT/node.txt"
 }
@@ -257,12 +259,13 @@ install_node() {
   if [[ -f "$ROOT/config.json" ]]; then
     grep -q '"inbounds"' "$ROOT/config.json" || fail '发现未知配置，停止覆盖。'
     legacy_import; migrating=1
-    read_address; read_port '公网映射端口' "$PUBLIC_PORT" PUBLIC_PORT
+    read_address
     is_systemd || fail '旧版迁移需要在原 systemd 环境执行。'
     systemctl stop jack-ss
   else
-    read_port '本机监听端口' 8388 LOCAL_PORT
-    read_address; read_port '公网映射端口' "$LOCAL_PORT" PUBLIC_PORT
+    read_port '端口' 8388 LOCAL_PORT
+    PUBLIC_PORT=$LOCAL_PORT
+    read_address
     read_mode; METHOD=chacha20-ietf-poly1305; random_password
   fi
   write_config; write_state; register_service
@@ -286,7 +289,7 @@ install_node() {
 change_settings() {
   load_state
   case "$1" in
-    ports) read_port '本机监听端口' "$LOCAL_PORT" LOCAL_PORT; read_port '公网映射端口' "$PUBLIC_PORT" PUBLIC_PORT;;
+    ports) read_port '端口' "$LOCAL_PORT" LOCAL_PORT; PUBLIC_PORT=$LOCAL_PORT;;
     password) ask '新密码（留空随机）：' PASSWORD; [[ -n "$PASSWORD" ]] || random_password;;
     address) read_address;; mode) read_mode;;
   esac

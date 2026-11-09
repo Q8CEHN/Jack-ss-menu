@@ -12,10 +12,10 @@
 root 登录后复制整行：
 
 ```sh
-sh -c 'set -e; if ! command -v bash >/dev/null || ! command -v curl >/dev/null; then if command -v apt-get >/dev/null; then apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true update && apt-get install -y --no-install-recommends bash curl ca-certificates; elif command -v apk >/dev/null; then apk add --no-cache bash curl ca-certificates; elif command -v dnf >/dev/null; then dnf install -y bash curl ca-certificates; elif command -v yum >/dev/null; then yum install -y bash curl ca-certificates; else exit 1; fi; fi; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; curl -fLSs --retry 2 "https://raw.githubusercontent.com/Q8CEHN/Jack-ss-menu/main/ss.sh?v=2.0.0" -o "$f"; bash "$f"'
+sh -c 'set -e; if ! command -v bash >/dev/null || ! command -v curl >/dev/null; then if command -v apt-get >/dev/null; then apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true update && apt-get install -y --no-install-recommends bash curl ca-certificates; elif command -v apk >/dev/null; then apk add --no-cache bash curl ca-certificates; elif command -v dnf >/dev/null; then dnf install -y bash curl ca-certificates; elif command -v yum >/dev/null; then yum install -y bash curl ca-certificates; else exit 1; fi; fi; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; curl -fLSs --retry 2 "https://raw.githubusercontent.com/Q8CEHN/Jack-ss-menu/main/ss.sh?v=2.0.1" -o "$f"; bash "$f"'
 ```
 
-看到 **2.0.0** 后，选择 **1. 安装 / 迁移**。
+看到 **2.0.1** 后，选择 **1. 安装 / 迁移**。
 
 以后打开菜单：
 
@@ -32,9 +32,9 @@ s-s
 | 本机监听端口 | `20001` |
 | 公网入口 IP / 域名 | 商家提供的公网入口 |
 | 公网映射端口 | `30001` |
-| 已映射 UDP 端口？ | 只有商家同时映射 UDP 时才选 `y` |
+| 启用 UDP？ | `y` 启用，留空关闭 |
 
-分享链接使用**公网映射端口**；服务监听**本机端口**。独立公网服务器的两处端口填一样即可。端口映射需在商家面板设置，云安全组和自定义防火墙也需放行；脚本无法替商家创建映射。
+分享链接使用**公网映射端口**；服务监听**本机端口**。独立公网服务器的两处端口填一样即可。
 
 ## 菜单
 

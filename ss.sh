@@ -2,7 +2,7 @@
 # JACK_SS_MENU — lightweight Shadowsocks manager.
 set -Eeuo pipefail
 umask 077
-VERSION=2.0.0
+VERSION=2.0.1
 ROOT=/etc/jack-ss
 MENU=/usr/local/bin/s-s
 UNIT=/etc/systemd/system/jack-ss.service
@@ -97,12 +97,12 @@ valid_host() { [[ -n "$1" && ${#1} -le 253 && "$1" != *[^a-zA-Z0-9.:-]* ]]; }
 read_address() {
   local guess=${HOST:-}
   if [[ -z "$guess" ]] && command -v curl >/dev/null; then guess=$(curl -4fsS --connect-timeout 2 --max-time 4 https://api.ipify.org || true); fi
-  ask "公网入口 IP / 域名（NAT 填商家提供的入口）[$guess]：" HOST
+  ask "公网 IP / 域名 [$guess]：" HOST
   HOST=${HOST:-$guess}; valid_host "$HOST" || fail '公网地址格式无效。'
 }
 read_mode() {
   local answer
-  ask '已映射 UDP 端口？[y/N]：' answer
+  ask '启用 UDP？[y/N]：' answer
   case "$answer" in y|Y) MODE=tcp_and_udp;; *) MODE=tcp_only;; esac
 }
 random_password() { PASSWORD=$(od -An -N18 -tx1 /dev/urandom | tr -d ' \n'); }
@@ -262,7 +262,7 @@ install_node() {
     systemctl stop jack-ss
   else
     read_port '本机监听端口' 8388 LOCAL_PORT
-    read_address; read_port '公网映射端口（直连填本机端口）' "$LOCAL_PORT" PUBLIC_PORT
+    read_address; read_port '公网映射端口' "$LOCAL_PORT" PUBLIC_PORT
     read_mode; METHOD=chacha20-ietf-poly1305; random_password
   fi
   write_config; write_state; register_service
@@ -282,7 +282,6 @@ install_node() {
   if (( migrating )); then rm -f /opt/jack-ss/sing-box /opt/jack-ss/sing-box.previous /opt/jack-ss/sing-box.new; rmdir /opt/jack-ss 2>/dev/null || true; fi
   firewall_add
   echo '安装完成'; node_info
-  echo '请确认商家端口映射和安全组已放行。'
 }
 change_settings() {
   load_state

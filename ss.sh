@@ -2,7 +2,7 @@
 # JACK_SS_MENU — lightweight Shadowsocks manager.
 set -Eeuo pipefail
 umask 077
-VERSION=3.0.0
+VERSION=3.1.0
 BASE=/etc/jack-ss
 ROOT=$BASE
 NODE_ID=legacy
@@ -357,7 +357,7 @@ change_settings() {
   fi
   rm -f "$ROOT/settings.previous" "$ROOT/config.json.previous"
   firewall_remove; firewall_add
-  node_info
+  if [[ "$1" == password ]]; then node_info; else echo '设置已保存'; fi
 }
 show_logs() {
   if is_systemd; then journalctl -u "$SERVICE" -n 30 --no-pager
@@ -414,9 +414,10 @@ update_menu() {
 }
 updates_menu() {
   local choice
-  printf '\n===== 更新 =====\n%s\n' '1. 更新菜单（获取新功能）' '2. 更新 SS 内核' '0. 返回'
+  menu_screen
+  printf '更新\n\n%s\n' '1. 更新菜单（获取新功能）' '2. 更新 SS 内核' '0. 返回'
   ask '请选择：' choice
-  case "$choice" in 1) update_menu;; 2) update_core;; 0) return;; *) echo '编号无效';; esac
+  case "$choice" in 1) update_menu;; 2) update_core; pause_menu;; 0) return;; *) echo '编号无效';; esac
 }
 core_is_shared_impl() {
   local exe target config origin=''
@@ -825,16 +826,19 @@ iplimit_menu() {
   load_state
   local choice value previous=''
   while true; do
-    printf '\n===== %s · IP 数量限制 =====\n' "$NAME"
-    iplimit_status
-    printf '%s\n' '按服务器看到的来源 IP 计数；同一公网 IP 合并，IPv4/IPv6 分别计数。' '5 分钟无流量释放名额；被替换 IP 等待 60 秒，避免反复互踢。' '按端口来源流量识别，不代表已通过 SS 密码验证。' '1. 设置 / 修改上限' '2. 查看当前 IP' '3. 清空接入顺序与等待记录' '4. 关闭限制' '0. 返回'
+    menu_screen
+    local cap=不限
+    [[ ! -f "$ROOT/ip-limit" ]] || read -r cap <"$ROOT/ip-limit"
+    printf '%s · IP 限制\n当前上限：%s\n\n' "$NAME" "$cap"
+    printf '%s\n' '按来源 IP 计数，不校验 SS 密码。' '超额替换最后接入者，被替换 IP 等待 60 秒。' '' '1. 设置上限' '2. 当前 IP' '3. 清空接入记录' '4. 关闭限制' '0. 返回'
+
     ask '请选择：' choice
     case "$choice" in
       1)
         ask '最多允许几个 IP？[1–4096，0 关闭]：' value
-        [[ "$value" =~ ^[0-9]{1,4}$ ]] && (( 10#$value <= 4096 )) || { echo '请输入 0–4096。'; continue; }
+        [[ "$value" =~ ^[0-9]{1,4}$ ]] && (( 10#$value <= 4096 )) || { echo '请输入 0–4096。'; pause_menu; continue; }
         value=$((10#$value))
-        if (( value == 0 )); then iplimit_disable; echo '已关闭限制'; continue; fi
+        if (( value == 0 )); then iplimit_disable; echo '已关闭限制'; pause_menu; continue; fi
         iplimit_install_deps
         previous=''; [[ ! -f "$ROOT/ip-limit" ]] || read -r previous <"$ROOT/ip-limit"
         printf '%s\n' "$value" >"$ROOT/ip-limit"
@@ -850,6 +854,7 @@ iplimit_menu() {
       4) iplimit_disable; echo '已关闭限制';;
       0) return;; *) echo '编号无效';;
     esac
+    pause_menu
   done
 }
 # Package ownership is global; credentials, services and limits are per-node.
@@ -889,7 +894,7 @@ current_required() {
 }
 list_nodes() {
   local id number=0
-  printf '\n%-6s %-16s %-8s %-10s %s\n' '编号' '名称' '端口' '状态' 'IP 上限'
+  printf '\n节点列表\n\n'
   while IFS= read -r id; do
     number=$((number + 1))
     (
@@ -897,26 +902,27 @@ list_nodes() {
       local state=已停止 limit=不限
       healthy && state=运行中
       [[ ! -f "$ROOT/ip-limit" ]] || read -r limit <"$ROOT/ip-limit"
-      printf '%-6s %-16s %-8s %-10s %s\n' "$number" "$NAME" "$LOCAL_PORT" "$state" "$limit"
+      printf '%s. %s [%s]\n   端口 %s  ·  IP 上限 %s\n\n' "$number" "$NAME" "$state" "$LOCAL_PORT" "$limit"
     )
   done < <(node_ids)
   (( number )) || echo '暂无节点。'
   return 0
 }
 select_node() {
+  NODE_CHOSEN=0
+  menu_screen
   local answer index
   local -a ids=()
   mapfile -t ids < <(node_ids)
   list_nodes
   (( ${#ids[@]} )) || return 0
   ask '选择节点编号（0 返回）：' answer
-  [[ "$answer" =~ ^[0-9]{1,5}$ ]] || { echo '编号无效'; return 0; }
+  [[ "$answer" =~ ^[0-9]{1,5}$ ]] || { echo '编号无效'; pause_menu; return 0; }
   index=$((10#$answer))
   (( index )) || return 0
-  (( index <= ${#ids[@]} )) || { echo '编号无效'; return 0; }
+  (( index <= ${#ids[@]} )) || { echo '编号无效'; pause_menu; return 0; }
   node_context "${ids[index-1]}"; load_state
-  echo "当前节点：$NAME（$LOCAL_PORT）"
-  node_info
+  NODE_CHOSEN=1
 }
 ensure_port_free() {
   local requested=$1 id port
@@ -1011,6 +1017,52 @@ uninstall_node() {
   if is_systemd; then systemctl daemon-reload; fi
   echo '全部卸载完成'; exit 0
 }
+menu_screen() {
+  # Clear the visible terminal only. Keep scrollback and noninteractive output.
+  if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb ]]; then printf '\033[2J\033[H'; fi
+  return 0
+}
+pause_menu() { local ignored; ask '按回车返回…' ignored; }
+node_settings_menu() {
+  local choice
+  while true; do
+    load_state; menu_screen
+    printf '%s · 编辑设置\n\n' "$NAME"
+    printf '%s\n' '1. 名称' '2. 端口' '3. 密码' '4. 公网地址' '5. TCP / UDP' '0. 返回'
+    ask '请选择：' choice
+    case "$choice" in
+      1) change_settings name;; 2) change_settings ports;; 3) change_settings password;;
+      4) change_settings address;; 5) change_settings mode;; 0) return;; *) echo '编号无效';;
+    esac
+    pause_menu
+  done
+}
+node_menu() {
+  local choice cap state protocol node_root=$ROOT
+  while [[ -f "$node_root/settings" ]]; do
+    load_state; menu_screen
+    cap=不限; state=已停止; protocol=TCP
+    [[ ! -f "$ROOT/ip-limit" ]] || read -r cap <"$ROOT/ip-limit"
+    healthy && state=运行中
+    [[ "$MODE" != tcp_and_udp ]] || protocol='TCP + UDP'
+    printf '%s\n%s:%s\n%s  ·  %s  ·  IP 上限 %s\n\n' "$NAME" "$HOST" "$PUBLIC_PORT" "$state" "$protocol" "$cap"
+    printf '%s\n' '1. 查看节点 / 分享链接' '2. 编辑设置' '3. IP 限制' '' '4. 启动' '5. 停止' '6. 重启' '7. 日志' '8. 删除此节点' '0. 返回'
+    ask '请选择：' choice
+    case "$choice" in
+      0) return;;
+      1) node_info; pause_menu;;
+      2) node_settings_menu;;
+      3) iplimit_menu;;
+      4) start_service; echo '已启动'; pause_menu;;
+      5) stop_service; echo '已停止'; pause_menu;;
+      6) restart_service; echo '已重启'; pause_menu;;
+      7) show_logs; pause_menu;;
+      8) delete_selected_node; [[ -f "$node_root/settings" ]] || return 0;;
+      *) echo '编号无效'; pause_menu;;
+    esac
+  done
+  return 0
+}
 main() {
   case "${1:-}" in
     --version) echo "$VERSION"; return;;
@@ -1025,25 +1077,19 @@ main() {
     ''|--menu) ;; *) fail "未知参数：$1";;
   esac
   install_menu
-  local -a ids=(); mapfile -t ids < <(node_ids)
-  if (( ${#ids[@]} )); then node_context "${ids[0]}"; fi
-  local choice current
+  local choice
   while true; do
-    current=未选择
-    if [[ -f "$ROOT/settings" ]]; then load_state; current="$NAME（$LOCAL_PORT）"; fi
-    printf '\n===== Jack SS 多节点版 %s =====\n当前节点：%s\n' "$VERSION" "$current"
-    printf '%s\n' '1. 新建节点 / 旧版迁移' '2. 节点列表 / 切换节点' '3. 修改当前节点端口' '4. 修改当前节点密码' '5. 启动当前节点' '6. 停止当前节点' '7. 重启当前节点' '8. 查看当前节点日志' '9. 更新菜单 / 内核' '10. 修改当前节点公网地址' '11. 卸载全部节点及本项目' '12. 当前节点 TCP / UDP 设置' '13. 当前节点 IP 数量限制' '14. 删除当前节点' '15. 修改当前节点名称' '0. 退出'
+    menu_screen
+    printf 'Jack SS  %s\n\n' "$VERSION"
+    printf '%s\n' '1. 新建节点' '2. 节点列表' '' '8. 卸载全部' '9. 更新' '0. 退出'
     ask '请选择：' choice
     case "$choice" in
-      0) return;; 1) add_node;; 2) select_node;; 9) updates_menu;; 11) uninstall_node;;
-      3|4|5|6|7|8|10|12|13|14|15)
-        current_required || continue
-        case "$choice" in
-          3) change_settings ports;; 4) change_settings password;; 5) load_state; start_service;;
-          6) stop_service;; 7) load_state; restart_service;; 8) show_logs;; 10) change_settings address;;
-          12) change_settings mode;; 13) iplimit_menu;; 14) delete_selected_node;; 15) change_settings name;;
-        esac;;
-      *) echo '编号无效';;
+      0) return;;
+      1) add_node; pause_menu; current_required && node_menu;;
+      2) select_node; if (( NODE_CHOSEN )); then node_menu; fi;;
+      9) updates_menu;;
+      8) uninstall_node;;
+      *) echo '编号无效'; pause_menu;;
     esac
   done
 }

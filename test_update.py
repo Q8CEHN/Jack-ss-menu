@@ -11,7 +11,7 @@ class UpdateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             menu = root / 's-s'
-            original = '# JACK_SS_MENU\nVERSION=3.0.0\n'
+            original = '# JACK_SS_MENU\nVERSION=3.1.0\n'
             menu.write_text(original)
             (root / 'fixture').write_text(downloaded)
             (root / 'settings').write_text('PASSWORD=unchanged\nLOCAL_PORT=8388\n')
@@ -35,7 +35,7 @@ fetch_menu_update
             return result, menu.read_text(), menu.stat().st_mode & 0o777, original
 
     def test_installs_new_menu_without_changing_node_configuration(self):
-        content = '# JACK_SS_MENU\nVERSION=3.0.1\necho ready\n'
+        content = '# JACK_SS_MENU\nVERSION=3.1.1\necho ready\n'
         result, actual, mode, _ = self.update(content)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(actual, content)
@@ -47,7 +47,7 @@ fetch_menu_update
         self.assertEqual(actual, original)
 
     def test_invalid_download_preserves_installed_menu(self):
-        for content in ('<html>error</html>', '# JACK_SS_MENU\nVERSION=3.0.1\nif then'):
+        for content in ('<html>error</html>', '# JACK_SS_MENU\nVERSION=3.1.1\nif then'):
             with self.subTest(content=content):
                 result, actual, _, original = self.update(content)
                 self.assertNotEqual(result.returncode, 0)

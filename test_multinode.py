@@ -82,7 +82,7 @@ class NodesTest(unittest.TestCase):
         self.assertEqual(json.loads((base / 'nodes/1/config.json').read_text())['password'], 'new-secret')
         self.assertNotIn('stop jack-ss\n', (self.root / 'service.log').read_text())
 
-    def test_limits_have_distinct_service_queue_table_and_status(self):
+    def test_limits_have_distinct_services_backends_and_status(self):
         self.create_pair('''
 for id in 1 2; do
   node_context "$id"; printf '%s\n' "$((id + 1))" >"$ROOT/ip-limit"; iplimit_apply
@@ -92,8 +92,12 @@ done
             service = f'jack-ss-iplimit-node-{n}'
             unit = (self.root / f'units/{service}.service').read_text()
             self.assertIn(f'--limit {cap}', unit)
-            self.assertIn(f'--table jack_ss_iplimit_n{n}', unit)
-            self.assertIn(f'--queue {30000 + n}', unit)
+            self.assertIn('--backend ', unit)
+            self.assertNotIn('CAP_NET_ADMIN', unit)
+            self.assertIn('Restart=always', unit)
+            self.assertIn('StartLimitIntervalSec=0', unit)
+            self.assertIn(f'ExecStartPost=/usr/bin/systemctl --no-block start jack-ss-node-{n}.service', unit)
+            self.assertNotIn('--queue', unit)
             self.assertIn(f'--status /run/{service}/status.json', unit)
             dropin = (self.root / f'units/jack-ss-node-{n}.service.d/iplimit.conf').read_text()
             self.assertIn(f'Requires={service}.service', dropin)
@@ -107,6 +111,35 @@ node_context 1; iplimit_disable
         self.assertTrue((self.root / 'base/nodes/2/ip-limit').exists())
         self.assertTrue((self.root / 'units/jack-ss-iplimit-node-2.service').exists())
         self.assertTrue((self.root / 'running-jack-ss-iplimit-node-2').exists())
+        restored = json.loads((self.root / 'base/nodes/1/config.json').read_text())
+        self.assertEqual(restored['server_port'], 18388)
+        self.assertEqual(restored['server'], '0.0.0.0')
+        self.assertFalse((self.root / 'base/nodes/1/ip-backend-port').exists())
+
+    def test_failed_relay_start_keeps_limit_and_private_backend(self):
+        self.create_pair()
+        self.shell('''
+systemctl() {
+  case "$1" in
+    start) touch "$TEST_DIR/running-$2";;
+    restart) return 1;;
+    stop) rm -f "$TEST_DIR/running-$2";;
+    is-active) [[ -f "$TEST_DIR/running-${@: -1}" ]];;
+    *) return 0;;
+  esac
+}
+journalctl() { echo 'simulated relay startup error'; }
+node_context 1
+iplimit_menu
+''', ['1', '2', '', '0'])
+        restored=json.loads((self.root/'base/nodes/1/config.json').read_text())
+        backend=int((self.root/'base/nodes/1/ip-backend-port').read_text())
+        self.assertEqual(restored['server_port'],backend)
+        self.assertEqual(restored['server'],'127.0.0.1')
+        self.assertEqual(restored['password'],'password-one')
+        self.assertEqual((self.root/'base/nodes/1/ip-limit').read_text().strip(),'2')
+        self.assertTrue((self.root/'units/jack-ss-iplimit-node-1.service').exists())
+        self.assertFalse((self.root/'running-jack-ss-node-1').exists())
 
     def test_duplicate_port_rejected_before_stopping_any_node(self):
         self.create_pair()

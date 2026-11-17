@@ -1,179 +1,57 @@
 import importlib.util
-import ipaddress
-import json
-import subprocess
+from pathlib import Path
 import tempfile
 import unittest
-from pathlib import Path
-from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location('guard', Path(__file__).with_name('ip_guard.py'))
-guard = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(guard)
+spec=importlib.util.spec_from_file_location('guard',Path(__file__).with_name('ip_guard.py'))
+guard=importlib.util.module_from_spec(spec); spec.loader.exec_module(guard)
 
-
-class AdmissionTest(unittest.TestCase):
+class PolicyTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.g = guard.Admission(2, 8388, Path(self.tmp.name) / 'status.json')
-        self.kernel = set()
-        self.banned = set()
-        self.transactions = []
-        self.calls = []
-        self.fail = False
-        self.addCleanup(patch.stopall)
-        patch.object(guard, 'nft', self.transaction).start()
-        patch.object(guard.subprocess, 'run', self.command_run).start()
+        self.now=0
+        self.evicted=[]
+        self.g=guard.Admission(2,self.evicted.append,lambda:self.now)
 
-    def transaction(self, text):
-        if self.fail:
-            raise subprocess.CalledProcessError(1, 'nft')
-        self.transactions.append(text)
-        for line in text.splitlines():
-            ip = line.split('{ ')[1].split()[0]
-            if line.startswith('delete'):
-                self.kernel.remove(ip)
-            elif ' banned' in line:
-                self.banned.add(ip)
-            else:
-                self.kernel.add(ip)
+    def test_new_ip_replaces_most_recent_admission(self):
+        for ip in ('A','B','C','D'): self.assertTrue(self.g.admit(ip))
+        self.assertEqual(list(self.g.active),['A','D'])
+        self.assertEqual(self.evicted,['B','C'])
 
-    def command_run(self, cmd, **kwargs):
-        self.calls.append(cmd)
-        if cmd[0] == 'ss':
-            return subprocess.CompletedProcess(cmd, 0)
-        entries = []
-        for name, ips in [('active', self.kernel), ('banned', self.banned)]:
-            for v in (4, 6):
-                entries.append({'set': {'name': f'{name}{v}', 'elem': [
-                    {'elem': {'val': ip, 'expires': 299000}}
-                    for ip in ips if ipaddress.ip_address(ip).version == v]}})
-        return subprocess.CompletedProcess(cmd, 0, json.dumps({'nftables': entries}))
+    def test_existing_connections_do_not_reorder(self):
+        for ip in ('A','B','A','C'): self.g.admit(ip)
+        self.assertEqual(list(self.g.active),['A','C'])
 
-    def test_user_example_and_next_newcomer(self):
-        for ip in ('192.0.2.1', '192.0.2.2', '192.0.2.3', '192.0.2.4'):
-            self.assertTrue(self.g.admit(ip))
-            self.assertLessEqual(len(self.kernel), 2)
-        self.assertEqual(list(self.g.active), ['192.0.2.1', '192.0.2.4'])
-        self.assertEqual(self.g.banned.keys(), {'192.0.2.2', '192.0.2.3'})
-        self.assertIn(['ss', '-K', 'dst', '192.0.2.3', 'sport', '=', ':8388'], self.calls)
+    def test_evicted_ip_reconnect_cannot_kick_new_client(self):
+        for ip in ('A','B','C'): self.g.admit(ip)
+        self.assertFalse(self.g.admit('B'))
+        self.assertEqual(list(self.g.active),['A','C'])
 
-    def test_existing_ip_keeps_first_admission_order(self):
-        for ip in ('192.0.2.1', '192.0.2.2', '192.0.2.1', '192.0.2.3'):
-            self.g.admit(ip)
-        self.assertEqual(list(self.g.active), ['192.0.2.1', '192.0.2.3'])
+    def test_waiting_expires(self):
+        for ip in ('A','B','C'): self.g.admit(ip)
+        self.now=61
+        self.assertTrue(self.g.admit('B'))
+        self.assertEqual(list(self.g.active),['A','B'])
 
-    def test_evicted_client_auto_reconnect_does_not_kick(self):
-        for ip in ('192.0.2.1', '192.0.2.2', '192.0.2.3'):
-            self.g.admit(ip)
-        self.assertFalse(self.g.admit('192.0.2.2'))
-        self.assertEqual(self.kernel, {'192.0.2.1', '192.0.2.3'})
+    def test_idle_expiry_frees_slot(self):
+        self.g.admit('A'); self.now=100; self.g.admit('B'); self.now=301
+        self.g.admit('C')
+        self.assertEqual(list(self.g.active),['B','C'])
+        self.assertEqual(self.evicted,['A'])
 
-    def test_limit_one(self):
-        self.g.limit = 1
-        self.g.admit('192.0.2.1')
-        self.g.admit('192.0.2.2')
-        self.assertEqual(self.kernel, {'192.0.2.2'})
+    def test_two_nodes_keep_independent_limits_and_bans(self):
+        second=guard.Admission(1)
+        for ip in ('A','B','C'): self.g.admit(ip)
+        second.admit('A'); second.admit('B')
+        self.assertTrue(self.g.admit('A')); self.assertFalse(second.admit('A'))
+        self.assertFalse(self.g.admit('B')); self.assertTrue(second.admit('B'))
 
-    def test_idle_slot_released_before_replacement(self):
-        self.g.admit('192.0.2.1')
-        self.g.admit('192.0.2.2')
-        self.kernel.remove('192.0.2.1')  # simulated nft timeout
-        self.g.admit('192.0.2.3')
-        self.assertEqual(list(self.g.active), ['192.0.2.2', '192.0.2.3'])
-        self.assertFalse(self.g.banned)
+    def test_ipv4_mapped_address_counted_as_same_ipv4(self):
+        self.assertEqual(guard.normalize_ip('::ffff:192.0.2.1'),'192.0.2.1')
+        self.assertEqual(guard.normalize_ip('2001:db8::1'),'2001:db8::1')
 
-    def test_expired_wait_can_reconnect(self):
-        self.g.limit = 1
-        self.g.admit('192.0.2.1')
-        self.g.admit('192.0.2.2')
-        self.banned.clear()
-        self.g.sync()
-        self.assertTrue(self.g.admit('192.0.2.1'))
-        self.assertEqual(self.kernel, {'192.0.2.1'})
+    def test_embedded_helper_matches_source(self):
+        script=Path(__file__).with_name('ss.sh').read_text()
+        embedded=script.split("<<'JACK_IP_GUARD_PY' || return 1\n",1)[1].split('\nJACK_IP_GUARD_PY',1)[0]
+        self.assertEqual(embedded.rstrip(),Path(__file__).with_name('ip_guard.py').read_text().rstrip())
 
-    def test_ipv6_shares_limit(self):
-        self.g.admit('192.0.2.1')
-        self.g.admit('2001:db8::1')
-        self.g.admit('2001:db8::2')
-        self.assertEqual(self.kernel, {'192.0.2.1', '2001:db8::2'})
-        self.assertIn('delete element inet jack_ss_iplimit active6', self.transactions[-1])
-
-    def test_failed_atomic_update_keeps_previous_admission(self):
-        self.g.admit('192.0.2.1')
-        self.g.admit('192.0.2.2')
-        self.fail = True
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.g.admit('192.0.2.3')
-        self.assertEqual(self.kernel, set(self.g.active))
-        self.assertEqual(len(self.g.active), 2)
-        self.assertFalse(self.g.banned)
-
-
-class WiringTest(unittest.TestCase):
-    def test_two_nodes_have_independent_admission_and_eviction(self):
-        tables = {}
-
-        def transaction(script):
-            for line in script.splitlines():
-                table = line.split()[3]
-                active, banned = tables.setdefault(table, (set(), set()))
-                ip = line.split('{ ')[1].split()[0]
-                if line.startswith('delete'): active.remove(ip)
-                elif ' banned' in line: banned.add(ip)
-                else: active.add(ip)
-
-        def run(cmd, **kwargs):
-            if cmd[0] == 'ss': return subprocess.CompletedProcess(cmd, 0)
-            active, banned = tables.setdefault(cmd[-1], (set(), set()))
-            entries = [{'set': {'name': name + '4', 'elem': list(values)}}
-                       for name, values in [('active', active), ('banned', banned)]]
-            return subprocess.CompletedProcess(cmd, 0, json.dumps({'nftables': entries}))
-
-        with tempfile.TemporaryDirectory() as root, patch.object(guard, 'nft', transaction), patch.object(guard.subprocess, 'run', run):
-            a = guard.Admission(2, 18388, Path(root) / 'a.json', 'jack_ss_iplimit_n1')
-            b = guard.Admission(1, 18389, Path(root) / 'b.json', 'jack_ss_iplimit_n2')
-            for ip in ('192.0.2.1', '192.0.2.2', '192.0.2.3'): a.admit(ip)
-            b.admit('192.0.2.1'); b.admit('192.0.2.2')
-            a.sync(); b.sync()
-            self.assertEqual(list(a.active), ['192.0.2.1', '192.0.2.3'])
-            self.assertEqual(list(b.active), ['192.0.2.2'])
-            self.assertTrue(a.admit('192.0.2.1'))
-            self.assertFalse(b.admit('192.0.2.1'))
-            self.assertFalse(a.admit('192.0.2.2'))
-            self.assertTrue(b.admit('192.0.2.2'))
-
-    def test_node_rules_use_own_port_and_queue(self):
-        a = guard.rules(18388, True, 'jack_ss_iplimit_n1', 30001)
-        b = guard.rules(18389, True, 'jack_ss_iplimit_n2', 30002)
-        self.assertIn('queue num 30001', a)
-        self.assertIn('queue num 30002', b)
-        self.assertNotIn('18389', a)
-        self.assertNotIn('jack_ss_iplimit_n2', a)
-        self.assertNotIn('18388', b)
-
-    def test_packet_source_v4_v6(self):
-        v4 = bytes([0x45]) + bytes(11) + ipaddress.ip_address('192.0.2.1').packed + bytes(4)
-        v6 = bytes([0x60]) + bytes(7) + ipaddress.ip_address('2001:db8::1').packed + bytes(16)
-        self.assertEqual(guard.packet_source(v4), '192.0.2.1')
-        self.assertEqual(guard.packet_source(v6), '2001:db8::1')
-        with self.assertRaises(ValueError): guard.packet_source(b'')
-
-    def test_rules_only_target_node_port_both_directions(self):
-        script = guard.rules(18388, True)
-        for proto in ('tcp', 'udp'):
-            self.assertIn(f'input {proto} dport 18388 jump admit', script)
-            self.assertIn(f'output {proto} sport 18388 drop', script)
-        self.assertNotIn('flush ruleset', script)
-        self.assertNotIn('bypass', script)
-        self.assertNotIn('udp dport', guard.rules(18388, False))
-
-    def test_single_file_installer_embeds_same_helper(self):
-        script = Path(__file__).with_name('ss.sh').read_text()
-        embedded = script.split("<<'JACK_IP_GUARD_PY' || return 1\n", 1)[1].split('\nJACK_IP_GUARD_PY', 1)[0]
-        self.assertEqual(embedded.rstrip(), Path(__file__).with_name('ip_guard.py').read_text().rstrip())
-
-
-if __name__ == '__main__':
-    unittest.main()
+if __name__=='__main__': unittest.main()

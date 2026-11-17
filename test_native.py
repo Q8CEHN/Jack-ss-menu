@@ -63,7 +63,7 @@ class NativeTest(unittest.TestCase):
         local_ports, servers = [], []
         for n in (1, 2):
             directory = Path(temp.name) / f'base/nodes/{n}'; directory.mkdir(parents=True)
-            remote, local = port(), port(); local_ports.append(local)
+            remote, local, backend = port(), port(), port(); local_ports.append(local)
             # Generate config with the actual menu function, not a test-only schema.
             script = Path(__file__).with_name('ss.sh')
             result = subprocess.run(['bash', '-c', '''
@@ -71,11 +71,13 @@ source "$1"
 BASE="$2/base"; node_context "$3"; NAME="node-$3"
 HOST=127.0.0.1; LOCAL_PORT=$4; PUBLIC_PORT=$4; PASSWORD="native-secret-$3"
 MODE=tcp_and_udp; METHOD=chacha20-ietf-poly1305
+echo 2 >"$ROOT/ip-limit"; echo "$5" >"$ROOT/ip-backend-port"
 write_config; write_state
-''', 'bash', str(script), temp.name, str(n), str(remote)], capture_output=True, text=True)
+''', 'bash', str(script), temp.name, str(n), str(remote), str(backend)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             config = json.loads((directory / 'config.json').read_text())
-            servers.append(launch([str(Path(BIN) / 'ss-server'), '-c', str(directory / 'config.json')], remote))
+            servers.append(launch([str(Path(BIN) / 'ss-server'), '-c', str(directory / 'config.json')], backend))
+            launch(['/usr/bin/python3', str(Path(__file__).with_name('ip_guard.py')), '--port', str(remote), '--backend', str(backend), '--limit', '2', '--bind', '127.0.0.1', '--udp', '--status', str(directory / 'status.json')], remote)
             launch([str(Path(BIN) / 'ss-tunnel'), '-s', '127.0.0.1', '-p', str(remote),
                     '-l', str(local), '-L', f'127.0.0.1:{tcp.server_address[1]}',
                     '-k', config['password'], '-m', config['method'], '-u'], local)

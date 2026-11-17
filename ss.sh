@@ -2,7 +2,7 @@
 # JACK_SS_MENU — lightweight Shadowsocks manager.
 set -Eeuo pipefail
 umask 077
-VERSION=3.1.0
+VERSION=3.2.0
 BASE=/etc/jack-ss
 ROOT=$BASE
 NODE_ID=legacy
@@ -106,12 +106,17 @@ json_escape() {
   printf '%s' "$s"
 }
 write_config() {
-  local bind_address=0.0.0.0
+  local bind_address=0.0.0.0 bind_port=$LOCAL_PORT
   [[ "$HOST" != *:* ]] || bind_address=::
+  if [[ -f "$ROOT/ip-limit" && -f "$ROOT/ip-backend-port" ]]; then
+    read -r bind_port <"$ROOT/ip-backend-port"
+    valid_port "$bind_port" || fail '内部端口配置无效。'
+    bind_address=127.0.0.1
+  fi
   cat >"$ROOT/config.json.new" <<JSON
 {
   "server": "$bind_address",
-  "server_port": $LOCAL_PORT,
+  "server_port": $bind_port,
   "password": "$(json_escape "$PASSWORD")",
   "method": "$METHOD",
   "timeout": 60,
@@ -497,265 +502,347 @@ remove_core_impl() {
   return 0
 }
 iplimit_install_deps_impl() {
-  is_systemd || fail 'IP 限制目前需要 systemd；节点其他功能不受影响。'
-  if command -v nft >/dev/null && command -v ss >/dev/null && /usr/bin/python3 -c 'import netfilterqueue' 2>/dev/null; then return; fi
-  command -v apt-get >/dev/null || fail 'IP 限制目前支持 Debian / Ubuntu，需软件源提供 python3-netfilterqueue。'
+  is_systemd || fail 'IP 限制目前需要 systemd。'
+  if [[ -x /usr/bin/python3 ]]; then return; fi
+  command -v apt-get >/dev/null || fail '请先安装系统 Python 3。'
   apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true update
-  apt-cache show python3-netfilterqueue >/dev/null 2>&1 || fail '当前软件源没有 python3-netfilterqueue，未启用限制。'
-  local dependency
-  for dependency in nftables python3 python3-netfilterqueue iproute2; do
-    if ! dpkg-query -W -f='${db:Status-Abbrev}' "$dependency" 2>/dev/null | grep -q '^ii'; then
-      printf '%s\n' "$dependency" >>"$ROOT/ip-packages.direct"
-    fi
-  done
+  printf 'python3\n' >>"$ROOT/ip-packages.direct"
   dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | sort -u >"$ROOT/packages.before"
-  # Installing a firewall utility must not start its example ruleset service.
-  if [[ ! -e "$POLICY_FILE" ]]; then
-    cat >"$POLICY_FILE" <<'POLICY'
-#!/bin/sh
-# JACK_SS_PACKAGE_GUARD
-case "$1" in nftables*) exit 101;; *) exit 0;; esac
-POLICY
-    chmod 755 "$POLICY_FILE"; POLICY_OWN=1
-  fi
-  DEBIAN_FRONTEND=noninteractive apt-get -o APT::Keep-Downloaded-Packages=false install -y --no-install-recommends nftables python3 python3-netfilterqueue iproute2
+  DEBIAN_FRONTEND=noninteractive apt-get -o APT::Keep-Downloaded-Packages=false install -y --no-install-recommends python3
   record_packages_after
-  cleanup; POLICY_OWN=0
 }
 write_ip_guard() {
   cat >"$ROOT/ip_guard.py.new" <<'JACK_IP_GUARD_PY' || return 1
 #!/usr/bin/python3
-"""JACK_SS_IP_GUARD: packet admission for this node only, no proxy decryption."""
+"""JACK_SS_IP_GUARD: per-node encrypted TCP/UDP relay, without kernel queues."""
 import argparse
+import asyncio
 import collections
+import contextlib
 import ipaddress
 import json
 import os
-import re
-import select
+from pathlib import Path
 import signal
 import socket
-import subprocess
 import time
-from pathlib import Path
 
-TABLE = "jack_ss_iplimit"
-QUEUE = 29083
 IDLE = 300
 COOLDOWN = 60
 
 
-def nft(script):
-    return subprocess.run(["nft", "-f", "-"], input=script, text=True,
-                          capture_output=True, check=True, timeout=5)
-
-
-def rules(port, udp, table=TABLE, queue=QUEUE):
-    ports = [f"tcp sport {port}"]  # output responses to the node's clients
-    if udp:
-        ports.append(f"udp sport {port}")
-    inputs = [p.replace("sport", "dport") for p in ports]
-    lines = [f"add table inet {table}"]
-    for family, kind in ((4, "ipv4_addr"), (6, "ipv6_addr")):
-        for name, timeout in (("active", IDLE), ("banned", COOLDOWN)):
-            lines.append(f"add set inet {table} {name}{family} "
-                         f"{{ type {kind}; flags dynamic,timeout; timeout {timeout}s; size 65536; }}")
-    lines += [f"add chain inet {table} input {{ type filter hook input priority -10; policy accept; }}",
-              f"add chain inet {table} output {{ type filter hook output priority -10; policy accept; }}",
-              f"add chain inet {table} admit"]
-    for p in inputs:
-        lines.append(f"add rule inet {table} input {p} jump admit")
-    for version, proto in ((4, "ip"), (6, "ip6")):
-        lines.append(f"add rule inet {table} admit {proto} saddr @banned{version} drop")
-        lines.append(f"add rule inet {table} admit {proto} saddr @active{version} "
-                     f"update @active{version} {{ {proto} saddr timeout {IDLE}s }} return")
-        for p in ports:
-            lines.append(f"add rule inet {table} output {p} {proto} daddr @banned{version} drop")
-            lines.append(f"add rule inet {table} output {p} {proto} daddr @active{version} "
-                         f"update @active{version} {{ {proto} daddr timeout {IDLE}s }} return")
-    # No bypass: an unavailable controller must not silently remove the limit.
-    lines.append(f"add rule inet {table} admit queue num {queue}")
-    for p in ports:
-        lines.append(f"add rule inet {table} output {p} drop")
-    return "\n".join(lines) + "\n"
-
-
-def packet_source(payload):
-    if not payload:
-        raise ValueError("empty packet")
-    version = payload[0] >> 4
-    if version == 4 and len(payload) >= 20:
-        return str(ipaddress.ip_address(payload[12:16]))
-    if version == 6 and len(payload) >= 40:
-        return str(ipaddress.ip_address(payload[8:24]))
-    raise ValueError("invalid IP packet")
+def normalize_ip(value):
+    ip = ipaddress.ip_address(value)
+    return str(ip.ipv4_mapped or ip) if isinstance(ip, ipaddress.IPv6Address) else str(ip)
 
 
 class Admission:
-    def __init__(self, limit, port, status, table=TABLE):
-        self.limit, self.port, self.status = limit, port, Path(status)
-        self.table = table
+    def __init__(self, limit, evict=lambda ip: None, clock=time.monotonic):
+        self.limit, self.evict, self.clock = limit, evict, clock
         self.active = collections.OrderedDict()
         self.banned = {}
 
-    def publish(self):
-        status = {"limit": self.limit, "active": list(self.active),
-                  "banned": list(self.banned), "updated": time.time(),
-                  "idle_seconds": IDLE, "cooldown_seconds": COOLDOWN}
-        tmp = self.status.with_suffix(".new")
-        tmp.write_text(json.dumps(status))
-        tmp.replace(self.status)
-
-    def sync(self):
-        data = subprocess.run(["nft", "-j", "list", "table", "inet", self.table],
-                              capture_output=True, text=True, check=True, timeout=5)
-        live, banned = set(), set()
-        for obj in json.loads(data.stdout)["nftables"]:
-            entry = obj.get("set", {})
-            if not entry.get("name", "").startswith(("active", "banned")):
-                continue
-            target = live if entry["name"].startswith("active") else banned
-            for elem in entry.get("elem", []):
-                if isinstance(elem, str):
-                    target.add(elem)
-                elif isinstance(elem, dict):
-                    value = elem.get("elem", elem).get("val")
-                    if isinstance(value, str):
-                        target.add(value)
-        self.active = collections.OrderedDict((ip, t) for ip, t in self.active.items() if ip in live)
-        self.banned = {ip: t for ip, t in self.banned.items() if ip in banned}
-        self.publish()
+    def expire(self):
+        now = self.clock()
+        for ip, touched in list(self.active.items()):
+            if now - touched >= IDLE:
+                del self.active[ip]
+                self.evict(ip)
+        self.banned = {ip: until for ip, until in self.banned.items() if until > now}
 
     def admit(self, ip):
+        self.expire()
         if ip in self.banned:
             return False
         if ip in self.active:
+            self.active[ip] = self.clock()
             return True
-        # A slot may have expired since the periodic status refresh.
-        self.sync()
-        version = ipaddress.ip_address(ip).version
-        victim = next(reversed(self.active), None) if len(self.active) >= self.limit else None
-        script = []
-        if victim:
-            family = ipaddress.ip_address(victim).version
-            script += [f"delete element inet {self.table} active{family} {{ {victim} }}",
-                       f"add element inet {self.table} banned{family} {{ {victim} timeout {COOLDOWN}s }}"]
-        script.append(f"add element inet {self.table} active{version} {{ {ip} timeout {IDLE}s }}")
-        # One atomic kernel transaction: remove victim before accepting newcomer.
-        nft("\n".join(script) + "\n")
-        if victim:
-            del self.active[victim]
-            self.banned[victim] = time.monotonic()
-            # Terminate only sockets on this node's listening port.
-            try:
-                subprocess.run(["ss", "-K", "dst", victim, "sport", "=", f":{self.port}"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                # Firewall denies both directions even when socket destroy is unsupported.
-                pass
-        self.active[ip] = time.monotonic()
-        self.publish()
+        if len(self.active) >= self.limit:
+            victim, _ = self.active.popitem(last=True)
+            self.banned[victim] = self.clock() + COOLDOWN
+            self.evict(victim)
+        self.active[ip] = self.clock()
         return True
+
+    def touch(self, ip):
+        if ip in self.active:
+            self.active[ip] = self.clock()
+
+
+class Reply(asyncio.DatagramProtocol):
+    def __init__(self, relay, key, ip):
+        self.relay, self.key, self.ip = relay, key, ip
+
+    def datagram_received(self, data, _):
+        if self.ip in self.relay.admission.active:
+            self.relay.admission.touch(self.ip)
+            self.relay.udp_touched[self.key] = time.monotonic()
+            self.relay.front_udp.sendto(data, self.key)
+
+
+class FrontUDP(asyncio.DatagramProtocol):
+    def __init__(self, relay):
+        self.relay = relay
+
+    def datagram_received(self, data, address):
+        r = self.relay
+        ip = normalize_ip(address[0])
+        if not r.admission.admit(ip):
+            return
+        r.udp_touched[address] = time.monotonic()
+        if address in r.udp_sessions:
+            r.udp_sessions[address].sendto(data)
+        elif address in r.pending_udp:
+            r.pending_udp[address].append(data)
+        else:
+            r.pending_udp[address] = collections.deque([data], maxlen=32)
+            task = asyncio.create_task(r.new_udp(address, ip))
+            r.udp_tasks.add(task)
+            task.add_done_callback(r.udp_tasks.discard)
+
+
+class Relay:
+    def __init__(self, limit, backend, status):
+        self.backend, self.status = backend, Path(status)
+        self.tcp_writers = collections.defaultdict(set)
+        self.udp_sessions, self.udp_touched, self.pending_udp = {}, {}, {}
+        self.udp_tasks = set()
+        self.front_udp = None
+        self.admission = Admission(limit, self.evict)
+
+    def evict(self, ip):
+        for writer in self.tcp_writers.pop(ip, set()):
+            writer.close()
+        for address in list(set(self.udp_sessions) | set(self.pending_udp)):
+            if normalize_ip(address[0]) == ip:
+                transport = self.udp_sessions.pop(address, None)
+                if transport:
+                    transport.close()
+                self.pending_udp.pop(address, None)
+                self.udp_touched.pop(address, None)
+
+    def publish(self):
+        data = {'limit': self.admission.limit, 'active': list(self.admission.active),
+                'banned': list(self.admission.banned), 'updated': time.time(),
+                'idle_seconds': IDLE, 'cooldown_seconds': COOLDOWN}
+        temp = self.status.with_suffix('.new')
+        temp.write_text(json.dumps(data))
+        temp.replace(self.status)
+
+    async def tcp_client(self, reader, writer):
+        ip = normalize_ip(writer.get_extra_info('peername')[0])
+        if not self.admission.admit(ip):
+            writer.close()
+            return
+        writers = self.tcp_writers[ip]
+        writers.add(writer)
+        upstream, pumps = None, []
+        try:
+            incoming, upstream = await asyncio.wait_for(asyncio.open_connection('127.0.0.1', self.backend), 5)
+            if ip not in self.admission.active or writer.is_closing():
+                return
+            writers.add(upstream)
+
+            async def pump(source, destination):
+                while data := await source.read(65536):
+                    if ip not in self.admission.active:
+                        return
+                    self.admission.touch(ip)
+                    destination.write(data)
+                    await destination.drain()
+                with contextlib.suppress(OSError, RuntimeError):
+                    destination.write_eof()
+
+            pumps = [asyncio.create_task(pump(reader, upstream)), asyncio.create_task(pump(incoming, writer))]
+            await asyncio.gather(*pumps)
+        except (OSError, asyncio.TimeoutError):
+            pass
+        finally:
+            for task in pumps:
+                task.cancel()
+            if pumps:
+                await asyncio.gather(*pumps, return_exceptions=True)
+            writer.close()
+            writers.discard(writer)
+            if upstream:
+                upstream.close()
+                writers.discard(upstream)
+            if not writers and self.tcp_writers.get(ip) is writers:
+                self.tcp_writers.pop(ip, None)
+
+    async def new_udp(self, address, ip):
+        transport = None
+        try:
+            transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: Reply(self, address, ip), remote_addr=('127.0.0.1', self.backend))
+            pending = self.pending_udp.pop(address, None)
+            if pending is None or ip not in self.admission.active:
+                transport.close()
+                return
+            self.udp_sessions[address] = transport
+            for data in pending:
+                transport.sendto(data)
+        except OSError:
+            if transport:
+                transport.close()
+            self.pending_udp.pop(address, None)
+            self.udp_touched.pop(address, None)
+
+    async def maintain(self):
+        while True:
+            self.admission.expire()
+            for address, touched in list(self.udp_touched.items()):
+                if time.monotonic() - touched >= IDLE:
+                    transport = self.udp_sessions.pop(address, None)
+                    if transport:
+                        transport.close()
+                    self.udp_touched.pop(address, None)
+            self.publish()
+            await asyncio.sleep(1)
+
+
+def bound_socket(host, port, kind):
+    family = socket.AF_INET6 if ':' in host else socket.AF_INET
+    sock = socket.socket(family, kind)
+    try:
+        if family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        if kind == socket.SOCK_STREAM:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.setblocking(False)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+async def run(args):
+    os.umask(0o077)
+    Path(args.status).parent.mkdir(parents=True, exist_ok=True)
+    relay = Relay(args.limit, args.backend, args.status)
+    server = await asyncio.start_server(relay.tcp_client, sock=bound_socket(args.bind, args.port, socket.SOCK_STREAM))
+    maintenance = stopped = None
+    try:
+        if args.udp:
+            relay.front_udp, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: FrontUDP(relay), sock=bound_socket(args.bind, args.port, socket.SOCK_DGRAM))
+        relay.publish()
+        notify = os.environ.get('NOTIFY_SOCKET')
+        if notify:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+                sock.connect('\0' + notify[1:] if notify.startswith('@') else notify)
+                sock.sendall(b'READY=1')
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+        maintenance = asyncio.create_task(relay.maintain())
+        stopped = asyncio.create_task(stop.wait())
+        done, _ = await asyncio.wait([maintenance, stopped], return_when=asyncio.FIRST_COMPLETED)
+        if maintenance in done:
+            maintenance.result()
+    finally:
+        server.close()
+        # Python 3.13 waits for accepted connections too: close them first.
+        for ip in list(relay.tcp_writers):
+            relay.evict(ip)
+        await server.wait_closed()
+        tasks = [task for task in (maintenance, stopped) if task]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for transport in relay.udp_sessions.values():
+            transport.close()
+        if relay.front_udp:
+            relay.front_udp.close()
+        for task in list(relay.udp_tasks):
+            task.cancel()
+        await asyncio.gather(*relay.udp_tasks, return_exceptions=True)
+        Path(args.status).unlink(missing_ok=True)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--limit", type=int, required=True)
-    parser.add_argument("--udp", action="store_true")
-    parser.add_argument("--table", default=TABLE)
-    parser.add_argument("--queue", type=int, default=QUEUE)
-    parser.add_argument("--status", default="/run/jack-ss-iplimit/status.json")
-    args = parser.parse_args()
-    if not 1 <= args.port <= 65535 or not 1 <= args.limit <= 4096:
-        parser.error("invalid port or limit")
-    if not re.fullmatch(r"jack_ss_iplimit(?:_n[1-9][0-9]{0,4})?", args.table) or not 1 <= args.queue <= 65535:
-        parser.error("invalid node table or queue")
-    from netfilterqueue import NetfilterQueue
-    os.umask(0o077)
-    Path(args.status).parent.mkdir(parents=True, exist_ok=True)
-    guard = Admission(args.limit, args.port, args.status, args.table)
-    queue = NetfilterQueue()
-    running = True
-    failed = False
-
-    def receive(packet):
-        nonlocal running, failed
-        try:
-            ip = packet_source(packet.get_payload())
-            allowed = guard.admit(ip)
-        except Exception as exc:
-            print(f"IP admission failed: {exc}", flush=True)
-            packet.drop()
-            # Callback exceptions can be swallowed by the C binding. Exit the loop.
-            running = False
-            failed = True
-            return
-        if allowed:
-            packet.accept()
-        else:
-            packet.drop()
-
-    # Bind before installing packet rules; a queue conflict leaves other rules alone.
-    queue.bind(args.queue, receive, max_len=4096)
-    def stop(*_):
-        nonlocal running
-        running = False
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-    # Replace only our own named table. Keep an existing table on startup failure.
-    existing = subprocess.run(["nft", "list", "table", "inet", args.table],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    nft((f"delete table inet {args.table}\n" if existing else "") + rules(args.port, args.udp, args.table, args.queue))
-    guard.publish()
-    # Type=notify starts the SS service only after the kernel rules are installed.
-    notify = os.environ.get("NOTIFY_SOCKET")
-    if notify:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
-            sock.connect("\0" + notify[1:] if notify.startswith("@") else notify)
-            sock.sendall(b"READY=1")
+    p = argparse.ArgumentParser()
+    p.add_argument('--port', type=int, required=True)
+    p.add_argument('--backend', type=int, required=True)
+    p.add_argument('--limit', type=int, required=True)
+    p.add_argument('--bind', default='0.0.0.0')
+    p.add_argument('--udp', action='store_true')
+    p.add_argument('--status', required=True)
+    args = p.parse_args()
+    if not 1 <= args.port <= 65535 or not 1 <= args.backend <= 65535 or args.port == args.backend or not 1 <= args.limit <= 4096:
+        p.error('invalid port or IP limit')
     try:
-        next_sync = time.monotonic() + 1
-        while running:
-            if select.select([queue.get_fd()], [], [], 1)[0]:
-                queue.run(block=False)
-            if time.monotonic() >= next_sync:
-                guard.sync()
-                next_sync = time.monotonic() + 1
-    finally:
-        queue.unbind()
-        Path(args.status).unlink(missing_ok=True)
-        # Leave rules fail-closed until restart or an explicit disable operation.
-    if failed:
-        raise SystemExit(1)
+        asyncio.run(run(args))
+    except OSError as exc:
+        raise SystemExit(f'IP relay could not start: {exc}') from exc
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
 JACK_IP_GUARD_PY
   chmod 700 "$ROOT/ip_guard.py.new" || return 1
   mv -f "$ROOT/ip_guard.py.new" "$ROOT/ip_guard.py"
 }
+iplimit_backend() {
+  local id
+  local -a reserved=("$LOCAL_PORT")
+  while IFS= read -r id; do reserved+=("$(node_context "$id"; load_state; printf '%s' "$LOCAL_PORT")"); done < <(node_ids)
+  /usr/bin/python3 - "$ROOT/ip-backend-port" "${reserved[@]}" <<'PY_BACKEND'
+import pathlib,socket,sys
+p=pathlib.Path(sys.argv[1]); reserved={int(x) for x in sys.argv[2:]}
+previous=int(p.read_text()) if p.exists() else 0
+for attempt in range(100):
+    tcp=socket.socket(); udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    try:
+        tcp.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+        tcp.bind(('127.0.0.1', previous if attempt==0 else 0))
+        port=tcp.getsockname()[1]
+        if port in reserved: continue
+        udp.bind(('127.0.0.1',port))
+        temp=p.with_suffix('.new'); temp.write_text(str(port)+'\n'); temp.replace(p)
+        break
+    except OSError:
+        continue
+    finally:
+        tcp.close(); udp.close()
+else: raise SystemExit('没有可用的内部转发端口。')
+PY_BACKEND
+}
+iplimit_clear_legacy_table() {
+  if command -v nft >/dev/null && nft list table inet "$TABLE" >/dev/null 2>&1; then
+    nft delete table inet "$TABLE" || return 1
+  fi
+}
 iplimit_apply() {
-  local limit udp=''
+  local limit backend udp='' bind=0.0.0.0
   read -r limit <"$ROOT/ip-limit"
-  [[ "$limit" =~ ^[0-9]{1,4}$ ]] && (( limit >= 1 && limit <= 4096 )) || fail 'IP 限制配置无效。'
+  [[ "$limit" =~ ^[0-9]{1,4}$ ]] && (( limit >= 1 && limit <= 4096 )) || { echo 'IP 上限无效。'; return 1; }
   load_state
-  [[ "$MODE" != tcp_and_udp ]] || udp='--udp'
+  [[ "$MODE" != tcp_and_udp ]] || udp=--udp
+  [[ "$HOST" != *:* ]] || bind=::
+  stop_service || return 1
+  systemctl stop "$GUARD" >/dev/null 2>&1 || true
+  iplimit_clear_legacy_table || return 1
+  iplimit_backend || return 1
+  read -r backend <"$ROOT/ip-backend-port"
+  write_config || return 1
   write_ip_guard || return 1
   cat >"$SYSTEMD_DIR/$GUARD.service" <<UNIT || return 1
 [Unit]
-Description=Jack SS IP limit
+Description=Jack SS per-node IP relay
+StartLimitIntervalSec=0
 After=network.target
 Before=$SERVICE.service
 PartOf=$SERVICE.service
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=/usr/bin/python3 $ROOT/ip_guard.py --port $LOCAL_PORT --limit $limit $udp --table $TABLE --queue $QUEUE --status /run/$GUARD/status.json
-Restart=on-failure
-RestartSec=2
+ExecStart=/usr/bin/python3 $ROOT/ip_guard.py --port $LOCAL_PORT --backend $backend --limit $limit --bind $bind $udp --status /run/$GUARD/status.json
+ExecStartPost=/usr/bin/systemctl --no-block start $SERVICE.service
+Restart=always
+RestartSec=3
 TimeoutStartSec=15
 RuntimeDirectory=$GUARD
 RuntimeDirectoryMode=0700
@@ -763,31 +850,43 @@ NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/run/$GUARD
-CapabilityBoundingSet=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 UNIT
   install -d -m 755 "$SYSTEMD_DIR/$SERVICE.service.d" || return 1
   cat >"$SYSTEMD_DIR/$SERVICE.service.d/iplimit.conf" <<UNIT || return 1
 [Unit]
 Requires=$GUARD.service
 After=$GUARD.service
+StartLimitIntervalSec=0
+[Service]
+Restart=always
+RestartSec=3
 UNIT
   systemctl daemon-reload || return 1
-  systemctl restart "$GUARD" || return 1
-  systemctl is-active --quiet "$GUARD"
+  if ! systemctl restart "$GUARD"; then
+    journalctl -u "$GUARD" -n 12 --no-pager >&2 || true
+    return 1
+  fi
+  systemctl is-active --quiet "$GUARD" || return 1
+  start_service || return 1
+  healthy
 }
 iplimit_disable() {
+  local was_running=0
+  healthy && was_running=1
+  if [[ -f "$ROOT/ip-backend-port" ]]; then stop_service || return 1; fi
   if is_systemd; then
     systemctl stop "$GUARD" >/dev/null 2>&1 || true
     if systemctl is-active --quiet "$GUARD"; then echo 'IP 限制服务无法停止。' >&2; return 1; fi
   fi
-  # Remove only the node's own table; never flush the host firewall.
-  if command -v nft >/dev/null && nft list table inet "$TABLE" >/dev/null 2>&1; then
-    nft delete table inet "$TABLE" || return 1
-  fi
+  iplimit_clear_legacy_table || return 1
   rm -f "$SYSTEMD_DIR/$GUARD.service" "$SYSTEMD_DIR/$SERVICE.service.d/iplimit.conf"
   rmdir "$SYSTEMD_DIR/$SERVICE.service.d" 2>/dev/null || true
-  rm -f "$ROOT/ip-limit" "$ROOT/ip_guard.py" "$ROOT/ip_guard.py.new"
+  rm -f "$ROOT/ip-limit" "$ROOT/ip_guard.py" "$ROOT/ip_guard.py.new" "$ROOT/ip-backend-port" "$ROOT/ip-backend-port.new"
+  if [[ -f "$ROOT/settings" ]]; then load_state; write_config || return 1; fi
   if is_systemd; then systemctl daemon-reload; systemctl reset-failed "$GUARD" >/dev/null 2>&1 || true; fi
+  if (( was_running )); then start_service || return 1; fi
+  return 0
 }
 iplimit_remove_deps_impl() {
   [[ -f "$ROOT/ip-packages.direct" ]] || return 0
@@ -807,7 +906,7 @@ iplimit_status() {
   local limit
   read -r limit <"$ROOT/ip-limit"
   echo "IP 上限：$limit；新 IP 替换最后接入的 IP。"
-  if ! systemctl is-active --quiet "$GUARD"; then echo '限制服务未运行，请启动节点或重新设置。'; return; fi
+  if ! systemctl is-active --quiet "$GUARD"; then echo '上限设置已保留；启动节点后继续生效，服务故障会自动重试。'; return; fi
   /usr/bin/python3 - "/run/$GUARD/status.json" <<'PY_STATUS'
 import json,sys
 from pathlib import Path
@@ -824,7 +923,7 @@ PY_STATUS
 }
 iplimit_menu() {
   load_state
-  local choice value previous=''
+  local choice value
   while true; do
     menu_screen
     local cap=不限
@@ -840,14 +939,10 @@ iplimit_menu() {
         value=$((10#$value))
         if (( value == 0 )); then iplimit_disable; echo '已关闭限制'; pause_menu; continue; fi
         iplimit_install_deps
-        previous=''; [[ ! -f "$ROOT/ip-limit" ]] || read -r previous <"$ROOT/ip-limit"
         printf '%s\n' "$value" >"$ROOT/ip-limit"
         if iplimit_apply; then echo '设置完成'; else
-          if [[ -n "$previous" ]]; then
-            printf '%s\n' "$previous" >"$ROOT/ip-limit"
-            iplimit_apply || fail '限制服务无法恢复，请关闭限制或查看 journalctl -u jack-ss-iplimit。'
-          else iplimit_disable; fi
-          echo '启用失败，已恢复原设置。'
+          echo '上限已保存，不会自动关闭。限制服务启动失败时会持续重试。'
+          echo '如需取消，请手动选择 4 关闭限制。'
         fi;;
       2) iplimit_status;;
       3) if [[ -f "$ROOT/ip-limit" ]]; then iplimit_apply; echo '已清空，新流量重新排序。'; else echo '尚未启用限制。'; fi;;

@@ -2,7 +2,7 @@
 # JACK_SS_MENU — lightweight Shadowsocks manager.
 set -Eeuo pipefail
 umask 077
-VERSION=2.0.3
+VERSION=2.1.1
 ROOT=/etc/jack-ss
 MENU=/usr/local/bin/s-s
 UNIT=/etc/systemd/system/jack-ss.service
@@ -14,8 +14,10 @@ VENDOR_CONFIG=/etc/shadowsocks-libev
 SYSTEMD_DIR=/etc/systemd/system
 INIT_DIR=/etc/init.d
 POLICY_OWN=0
+UPDATE_TMP=''
 cleanup() {
   if (( POLICY_OWN )) && [[ -f "$POLICY_FILE" ]] && grep -q JACK_SS_PACKAGE_GUARD "$POLICY_FILE"; then rm -f "$POLICY_FILE"; fi
+  if [[ -n "$UPDATE_TMP" ]]; then rm -f -- "$UPDATE_TMP"; fi
 }
 trap cleanup EXIT
 fail() { echo "错误：$*" >&2; exit 1; }
@@ -321,11 +323,18 @@ change_settings() {
   esac
   cp -p "$ROOT/settings" "$ROOT/settings.previous"
   cp -p "$ROOT/config.json" "$ROOT/config.json.previous"
+  stop_service || fail '无法停止节点，未修改配置。'
   write_config; write_state
-  if ! restart_service; then echo '重启失败。'; fi
+  if [[ -f "$ROOT/ip-limit" ]] && ! iplimit_apply; then
+    mv -f "$ROOT/settings.previous" "$ROOT/settings"; mv -f "$ROOT/config.json.previous" "$ROOT/config.json"
+    iplimit_apply || fail '限制服务恢复失败，请查看日志。'
+    start_service || true; fail 'IP 限制更新失败，已恢复旧配置。'
+  fi
+  if ! start_service; then echo '重启失败。'; fi
   sleep 1
   if ! healthy; then
     mv -f "$ROOT/settings.previous" "$ROOT/settings"; mv -f "$ROOT/config.json.previous" "$ROOT/config.json"
+    if [[ -f "$ROOT/ip-limit" ]]; then iplimit_apply || fail '限制服务恢复失败，请查看日志。'; fi
     restart_service || true; fail '修改失败，已恢复旧配置。'
   fi
   rm -f "$ROOT/settings.previous" "$ROOT/config.json.previous"
@@ -347,6 +356,44 @@ update_core() {
   elif command -v yum >/dev/null; then yum update -y shadowsocks-libev; fi
   restart_service; sleep 1; healthy || fail '更新后启动失败。'
   echo '更新完成'
+}
+fetch_menu_update() {
+  local release newest
+  command -v curl >/dev/null || { echo '未找到 curl，请先安装 curl。' >&2; return 1; }
+  UPDATE_TMP=$(mktemp "${MENU}.update.XXXXXX") || return 1
+  if ! curl -fLSs --retry 2 --connect-timeout 10 --max-time 90 --proto '=https' --proto-redir '=https' \
+    "https://raw.githubusercontent.com/Q8CEHN/Jack-ss-menu/main/ss.sh?update=$(date +%s)" -o "$UPDATE_TMP"; then
+    echo '下载失败，保留当前菜单。' >&2; rm -f "$UPDATE_TMP"; UPDATE_TMP=''; return 1
+  fi
+  release=$(sed -n 's/^VERSION=//p' "$UPDATE_TMP")
+  if ! grep -q '^# JACK_SS_MENU' "$UPDATE_TMP" || ! bash -n "$UPDATE_TMP" ||
+     [[ ! "$release" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo '下载内容不是有效的菜单脚本，保留当前菜单。' >&2
+    rm -f "$UPDATE_TMP"; UPDATE_TMP=''; return 1
+  fi
+  newest=$(printf '%s\n%s\n' "$VERSION" "$release" | sort -V | tail -1)
+  if [[ "$newest" != "$release" ]]; then
+    echo "远端版本 $release 低于当前 $VERSION，保留当前菜单。" >&2
+    rm -f "$UPDATE_TMP"; UPDATE_TMP=''; return 1
+  fi
+  [[ ! -e "$MENU" ]] || grep -q JACK_SS_MENU "$MENU" || { echo '快捷命令被其他程序占用。' >&2; return 1; }
+  chmod 755 "$UPDATE_TMP" || return 1
+  mv -f -- "$UPDATE_TMP" "$MENU" || return 1
+  UPDATE_TMP=''
+  echo "菜单已更新至 $release，节点配置已保留。"
+}
+update_menu() {
+  if fetch_menu_update; then
+    cleanup
+    exec bash "$MENU" --menu
+  fi
+  return 0
+}
+updates_menu() {
+  local choice
+  printf '\n===== 更新 =====\n%s\n' '1. 更新菜单（获取新功能）' '2. 更新 SS 内核' '0. 返回'
+  ask '请选择：' choice
+  case "$choice" in 1) update_menu;; 2) update_core;; 0) return;; *) echo '编号无效';; esac
 }
 core_is_shared() {
   local exe target config origin=''
@@ -430,6 +477,8 @@ uninstall_node() {
   [[ "$answer" == YES ]] || return 0
   stop_service || true
   if healthy; then fail '服务仍在运行，卸载未完成。'; fi
+  iplimit_disable
+  iplimit_remove_deps
   firewall_remove
   remove_core || fail '软件包清理失败，保留配置以便重试。'
   if is_systemd; then systemctl disable jack-ss >/dev/null 2>&1 || true; fi
@@ -453,6 +502,347 @@ uninstall_node() {
   if [[ -e "$ROOT" || -e "$CORE_DIR" || -e "$UNIT" ]]; then fail '仍有文件未删除，卸载未完成。'; fi
   echo '卸载完成'; exit 0
 }
+iplimit_install_deps() {
+  is_systemd || fail 'IP 限制目前需要 systemd；节点其他功能不受影响。'
+  if command -v nft >/dev/null && command -v ss >/dev/null && /usr/bin/python3 -c 'import netfilterqueue' 2>/dev/null; then return; fi
+  command -v apt-get >/dev/null || fail 'IP 限制目前支持 Debian / Ubuntu，需软件源提供 python3-netfilterqueue。'
+  apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true update
+  apt-cache show python3-netfilterqueue >/dev/null 2>&1 || fail '当前软件源没有 python3-netfilterqueue，未启用限制。'
+  local dependency
+  for dependency in nftables python3 python3-netfilterqueue iproute2; do
+    if ! dpkg-query -W -f='${db:Status-Abbrev}' "$dependency" 2>/dev/null | grep -q '^ii'; then
+      printf '%s\n' "$dependency" >>"$ROOT/ip-packages.direct"
+    fi
+  done
+  dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | sort -u >"$ROOT/packages.before"
+  DEBIAN_FRONTEND=noninteractive apt-get -o APT::Keep-Downloaded-Packages=false install -y --no-install-recommends nftables python3 python3-netfilterqueue iproute2
+  record_packages_after
+}
+write_ip_guard() {
+  cat >"$ROOT/ip_guard.py.new" <<'JACK_IP_GUARD_PY' || return 1
+#!/usr/bin/python3
+"""JACK_SS_IP_GUARD: packet admission for this node only, no proxy decryption."""
+import argparse
+import collections
+import ipaddress
+import json
+import os
+import select
+import signal
+import socket
+import subprocess
+import time
+from pathlib import Path
+
+TABLE = "jack_ss_iplimit"
+QUEUE = 29083
+IDLE = 300
+COOLDOWN = 60
+
+
+def nft(script):
+    return subprocess.run(["nft", "-f", "-"], input=script, text=True,
+                          capture_output=True, check=True, timeout=5)
+
+
+def rules(port, udp):
+    ports = [f"tcp sport {port}"]  # output responses to the node's clients
+    if udp:
+        ports.append(f"udp sport {port}")
+    inputs = [p.replace("sport", "dport") for p in ports]
+    lines = [f"add table inet {TABLE}"]
+    for family, kind in ((4, "ipv4_addr"), (6, "ipv6_addr")):
+        for name, timeout in (("active", IDLE), ("banned", COOLDOWN)):
+            lines.append(f"add set inet {TABLE} {name}{family} "
+                         f"{{ type {kind}; flags dynamic,timeout; timeout {timeout}s; size 65536; }}")
+    lines += [f"add chain inet {TABLE} input {{ type filter hook input priority -10; policy accept; }}",
+              f"add chain inet {TABLE} output {{ type filter hook output priority -10; policy accept; }}",
+              f"add chain inet {TABLE} admit"]
+    for p in inputs:
+        lines.append(f"add rule inet {TABLE} input {p} jump admit")
+    for version, proto in ((4, "ip"), (6, "ip6")):
+        lines.append(f"add rule inet {TABLE} admit {proto} saddr @banned{version} drop")
+        lines.append(f"add rule inet {TABLE} admit {proto} saddr @active{version} "
+                     f"update @active{version} {{ {proto} saddr timeout {IDLE}s }} return")
+        for p in ports:
+            lines.append(f"add rule inet {TABLE} output {p} {proto} daddr @banned{version} drop")
+            lines.append(f"add rule inet {TABLE} output {p} {proto} daddr @active{version} "
+                         f"update @active{version} {{ {proto} daddr timeout {IDLE}s }} return")
+    # No bypass: an unavailable controller must not silently remove the limit.
+    lines.append(f"add rule inet {TABLE} admit queue num {QUEUE}")
+    for p in ports:
+        lines.append(f"add rule inet {TABLE} output {p} drop")
+    return "\n".join(lines) + "\n"
+
+
+def packet_source(payload):
+    if not payload:
+        raise ValueError("empty packet")
+    version = payload[0] >> 4
+    if version == 4 and len(payload) >= 20:
+        return str(ipaddress.ip_address(payload[12:16]))
+    if version == 6 and len(payload) >= 40:
+        return str(ipaddress.ip_address(payload[8:24]))
+    raise ValueError("invalid IP packet")
+
+
+class Admission:
+    def __init__(self, limit, port, status):
+        self.limit, self.port, self.status = limit, port, Path(status)
+        self.active = collections.OrderedDict()
+        self.banned = {}
+
+    def publish(self):
+        status = {"limit": self.limit, "active": list(self.active),
+                  "banned": list(self.banned), "updated": time.time(),
+                  "idle_seconds": IDLE, "cooldown_seconds": COOLDOWN}
+        tmp = self.status.with_suffix(".new")
+        tmp.write_text(json.dumps(status))
+        tmp.replace(self.status)
+
+    def sync(self):
+        data = subprocess.run(["nft", "-j", "list", "table", "inet", TABLE],
+                              capture_output=True, text=True, check=True, timeout=5)
+        live, banned = set(), set()
+        for obj in json.loads(data.stdout)["nftables"]:
+            entry = obj.get("set", {})
+            if not entry.get("name", "").startswith(("active", "banned")):
+                continue
+            target = live if entry["name"].startswith("active") else banned
+            for elem in entry.get("elem", []):
+                if isinstance(elem, str):
+                    target.add(elem)
+                elif isinstance(elem, dict):
+                    value = elem.get("elem", elem).get("val")
+                    if isinstance(value, str):
+                        target.add(value)
+        self.active = collections.OrderedDict((ip, t) for ip, t in self.active.items() if ip in live)
+        self.banned = {ip: t for ip, t in self.banned.items() if ip in banned}
+        self.publish()
+
+    def admit(self, ip):
+        if ip in self.banned:
+            return False
+        if ip in self.active:
+            return True
+        # A slot may have expired since the periodic status refresh.
+        self.sync()
+        version = ipaddress.ip_address(ip).version
+        victim = next(reversed(self.active), None) if len(self.active) >= self.limit else None
+        script = []
+        if victim:
+            family = ipaddress.ip_address(victim).version
+            script += [f"delete element inet {TABLE} active{family} {{ {victim} }}",
+                       f"add element inet {TABLE} banned{family} {{ {victim} timeout {COOLDOWN}s }}"]
+        script.append(f"add element inet {TABLE} active{version} {{ {ip} timeout {IDLE}s }}")
+        # One atomic kernel transaction: remove victim before accepting newcomer.
+        nft("\n".join(script) + "\n")
+        if victim:
+            del self.active[victim]
+            self.banned[victim] = time.monotonic()
+            # Terminate only sockets on this node's listening port.
+            try:
+                subprocess.run(["ss", "-K", "dst", victim, "sport", "=", f":{self.port}"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                # Firewall denies both directions even when socket destroy is unsupported.
+                pass
+        self.active[ip] = time.monotonic()
+        self.publish()
+        return True
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--limit", type=int, required=True)
+    parser.add_argument("--udp", action="store_true")
+    parser.add_argument("--status", default="/run/jack-ss-iplimit/status.json")
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535 or not 1 <= args.limit <= 4096:
+        parser.error("invalid port or limit")
+    from netfilterqueue import NetfilterQueue
+    os.umask(0o077)
+    Path(args.status).parent.mkdir(parents=True, exist_ok=True)
+    guard = Admission(args.limit, args.port, args.status)
+    queue = NetfilterQueue()
+    running = True
+    failed = False
+
+    def receive(packet):
+        nonlocal running, failed
+        try:
+            ip = packet_source(packet.get_payload())
+            allowed = guard.admit(ip)
+        except Exception as exc:
+            print(f"IP admission failed: {exc}", flush=True)
+            packet.drop()
+            # Callback exceptions can be swallowed by the C binding. Exit the loop.
+            running = False
+            failed = True
+            return
+        if allowed:
+            packet.accept()
+        else:
+            packet.drop()
+
+    # Bind before installing packet rules; a queue conflict leaves other rules alone.
+    queue.bind(QUEUE, receive, max_len=4096)
+    def stop(*_):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    # Replace only our own named table. Keep an existing table on startup failure.
+    existing = subprocess.run(["nft", "list", "table", "inet", TABLE],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    nft((f"delete table inet {TABLE}\n" if existing else "") + rules(args.port, args.udp))
+    guard.publish()
+    # Type=notify starts the SS service only after the kernel rules are installed.
+    notify = os.environ.get("NOTIFY_SOCKET")
+    if notify:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect("\0" + notify[1:] if notify.startswith("@") else notify)
+            sock.sendall(b"READY=1")
+    try:
+        next_sync = time.monotonic() + 1
+        while running:
+            if select.select([queue.get_fd()], [], [], 1)[0]:
+                queue.run(block=False)
+            if time.monotonic() >= next_sync:
+                guard.sync()
+                next_sync = time.monotonic() + 1
+    finally:
+        queue.unbind()
+        Path(args.status).unlink(missing_ok=True)
+        # Leave rules fail-closed until restart or an explicit disable operation.
+    if failed:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
+JACK_IP_GUARD_PY
+  chmod 700 "$ROOT/ip_guard.py.new" || return 1
+  mv -f "$ROOT/ip_guard.py.new" "$ROOT/ip_guard.py"
+}
+iplimit_apply() {
+  local limit udp=''
+  read -r limit <"$ROOT/ip-limit"
+  [[ "$limit" =~ ^[0-9]{1,4}$ ]] && (( limit >= 1 && limit <= 4096 )) || fail 'IP 限制配置无效。'
+  load_state
+  [[ "$MODE" != tcp_and_udp ]] || udp='--udp'
+  write_ip_guard || return 1
+  cat >"/etc/systemd/system/jack-ss-iplimit.service" <<UNIT || return 1
+[Unit]
+Description=Jack SS IP limit
+After=network.target
+Before=jack-ss.service
+PartOf=jack-ss.service
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/python3 /etc/jack-ss/ip_guard.py --port $LOCAL_PORT --limit $limit $udp
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=15
+RuntimeDirectory=jack-ss-iplimit
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/jack-ss-iplimit
+CapabilityBoundingSet=CAP_NET_ADMIN
+UNIT
+  install -d -m 755 /etc/systemd/system/jack-ss.service.d || return 1
+  cat >/etc/systemd/system/jack-ss.service.d/iplimit.conf <<'UNIT' || return 1
+[Unit]
+Requires=jack-ss-iplimit.service
+After=jack-ss-iplimit.service
+UNIT
+  systemctl daemon-reload || return 1
+  systemctl restart jack-ss-iplimit || return 1
+  systemctl is-active --quiet jack-ss-iplimit
+}
+iplimit_disable() {
+  if is_systemd; then
+    systemctl stop jack-ss-iplimit >/dev/null 2>&1 || true
+    if systemctl is-active --quiet jack-ss-iplimit; then echo 'IP 限制服务无法停止。' >&2; return 1; fi
+  fi
+  # Remove only the node's own table; never flush the host firewall.
+  if command -v nft >/dev/null && nft list table inet jack_ss_iplimit >/dev/null 2>&1; then
+    nft delete table inet jack_ss_iplimit || return 1
+  fi
+  rm -f /etc/systemd/system/jack-ss-iplimit.service /etc/systemd/system/jack-ss.service.d/iplimit.conf
+  rmdir /etc/systemd/system/jack-ss.service.d 2>/dev/null || true
+  rm -f "$ROOT/ip-limit" "$ROOT/ip_guard.py" "$ROOT/ip_guard.py.new"
+  if is_systemd; then systemctl daemon-reload; systemctl reset-failed jack-ss-iplimit >/dev/null 2>&1 || true; fi
+}
+iplimit_remove_deps() {
+  [[ -f "$ROOT/ip-packages.direct" ]] || return 0
+  local -a packages=()
+  local result=0 package
+  mapfile -t packages <"$ROOT/ip-packages.direct"
+  if command -v apt-get >/dev/null; then
+    for package in "${packages[@]}"; do
+      result=0
+      apt_purge_checked "$package" || result=$?
+      (( result == 0 || result == 2 )) || return "$result"
+    done
+  fi
+}
+iplimit_status() {
+  if [[ ! -f "$ROOT/ip-limit" ]]; then echo 'IP 限制：关闭'; return; fi
+  local limit
+  read -r limit <"$ROOT/ip-limit"
+  echo "IP 上限：$limit；新 IP 替换最后接入的 IP。"
+  if ! systemctl is-active --quiet jack-ss-iplimit; then echo '限制服务未运行，请启动节点或重新设置。'; return; fi
+  /usr/bin/python3 - <<'PY_STATUS'
+import json
+from pathlib import Path
+p=Path('/run/jack-ss-iplimit/status.json')
+if not p.exists():
+    print('正在加载 IP 列表。')
+else:
+    c=json.loads(p.read_text())
+    print('当前 IP（按首次接入顺序）：')
+    for n, ip in enumerate(c['active'],1): print(f'  {n}. {ip}')
+    if not c['active']: print('  暂无')
+    if c['banned']: print('等待重连：' + '、'.join(c['banned']))
+PY_STATUS
+}
+iplimit_menu() {
+  load_state
+  local choice value previous=''
+  while true; do
+    printf '\n===== IP 数量限制 =====\n'
+    iplimit_status
+    printf '%s\n' '按服务器看到的来源 IP 计数；同一公网 IP 合并，IPv4/IPv6 分别计数。' '5 分钟无流量释放名额；被替换 IP 等待 60 秒，避免反复互踢。' '按端口来源流量识别，不代表已通过 SS 密码验证。' '1. 设置 / 修改上限' '2. 查看当前 IP' '3. 清空接入顺序与等待记录' '4. 关闭限制' '0. 返回'
+    ask '请选择：' choice
+    case "$choice" in
+      1)
+        ask '最多允许几个 IP？[1–4096，0 关闭]：' value
+        [[ "$value" =~ ^[0-9]{1,4}$ ]] && (( 10#$value <= 4096 )) || { echo '请输入 0–4096。'; continue; }
+        value=$((10#$value))
+        if (( value == 0 )); then iplimit_disable; echo '已关闭限制'; continue; fi
+        iplimit_install_deps
+        previous=''; [[ ! -f "$ROOT/ip-limit" ]] || read -r previous <"$ROOT/ip-limit"
+        printf '%s\n' "$value" >"$ROOT/ip-limit"
+        if iplimit_apply; then echo '设置完成'; else
+          if [[ -n "$previous" ]]; then
+            printf '%s\n' "$previous" >"$ROOT/ip-limit"
+            iplimit_apply || fail '限制服务无法恢复，请关闭限制或查看 journalctl -u jack-ss-iplimit。'
+          else iplimit_disable; fi
+          echo '启用失败，已恢复原设置。'
+        fi;;
+      2) iplimit_status;;
+      3) if [[ -f "$ROOT/ip-limit" ]]; then iplimit_apply; echo '已清空，新流量重新排序。'; else echo '尚未启用限制。'; fi;;
+      4) iplimit_disable; echo '已关闭限制';;
+      0) return;; *) echo '编号无效';;
+    esac
+  done
+}
 main() {
   case "${1:-}" in --version) echo "$VERSION"; return;; --help) echo 's-s：中文菜单；--start / --stop / --restart：管理服务；--uninstall：彻底卸载。'; return;; esac
   root_check
@@ -464,12 +854,12 @@ main() {
   install_menu
   while true; do
     printf '\n===== Jack SS 轻量版 %s =====\n' "$VERSION"
-    printf '%s\n' '1. 安装 / 迁移' '2. 查看节点' '3. 修改端口' '4. 修改密码' '5. 启动' '6. 停止' '7. 重启' '8. 查看日志' '9. 更新内核' '10. 修改公网地址' '11. 彻底卸载' '12. TCP / UDP 设置' '0. 退出'
+    printf '%s\n' '1. 安装 / 迁移' '2. 查看节点' '3. 修改端口' '4. 修改密码' '5. 启动' '6. 停止' '7. 重启' '8. 查看日志' '9. 更新菜单 / 内核' '10. 修改公网地址' '11. 彻底卸载' '12. TCP / UDP 设置' '13. IP 数量限制' '0. 退出'
     ask '请选择：' choice
     case "$choice" in
       1) install_node;; 2) node_info;; 3) change_settings ports;; 4) change_settings password;;
       5) load_state; start_service;; 6) stop_service;; 7) load_state; restart_service;;
-      8) show_logs;; 9) update_core;; 10) change_settings address;; 11) uninstall_node;; 12) change_settings mode;; 0) return;; *) echo '编号无效';;
+      8) show_logs;; 9) updates_menu;; 10) change_settings address;; 11) uninstall_node;; 12) change_settings mode;; 13) iplimit_menu;; 0) return;; *) echo '编号无效';;
     esac
   done
 }

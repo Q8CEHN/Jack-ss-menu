@@ -112,6 +112,47 @@ class AdmissionTest(unittest.TestCase):
 
 
 class WiringTest(unittest.TestCase):
+    def test_two_nodes_have_independent_admission_and_eviction(self):
+        tables = {}
+
+        def transaction(script):
+            for line in script.splitlines():
+                table = line.split()[3]
+                active, banned = tables.setdefault(table, (set(), set()))
+                ip = line.split('{ ')[1].split()[0]
+                if line.startswith('delete'): active.remove(ip)
+                elif ' banned' in line: banned.add(ip)
+                else: active.add(ip)
+
+        def run(cmd, **kwargs):
+            if cmd[0] == 'ss': return subprocess.CompletedProcess(cmd, 0)
+            active, banned = tables.setdefault(cmd[-1], (set(), set()))
+            entries = [{'set': {'name': name + '4', 'elem': list(values)}}
+                       for name, values in [('active', active), ('banned', banned)]]
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({'nftables': entries}))
+
+        with tempfile.TemporaryDirectory() as root, patch.object(guard, 'nft', transaction), patch.object(guard.subprocess, 'run', run):
+            a = guard.Admission(2, 18388, Path(root) / 'a.json', 'jack_ss_iplimit_n1')
+            b = guard.Admission(1, 18389, Path(root) / 'b.json', 'jack_ss_iplimit_n2')
+            for ip in ('192.0.2.1', '192.0.2.2', '192.0.2.3'): a.admit(ip)
+            b.admit('192.0.2.1'); b.admit('192.0.2.2')
+            a.sync(); b.sync()
+            self.assertEqual(list(a.active), ['192.0.2.1', '192.0.2.3'])
+            self.assertEqual(list(b.active), ['192.0.2.2'])
+            self.assertTrue(a.admit('192.0.2.1'))
+            self.assertFalse(b.admit('192.0.2.1'))
+            self.assertFalse(a.admit('192.0.2.2'))
+            self.assertTrue(b.admit('192.0.2.2'))
+
+    def test_node_rules_use_own_port_and_queue(self):
+        a = guard.rules(18388, True, 'jack_ss_iplimit_n1', 30001)
+        b = guard.rules(18389, True, 'jack_ss_iplimit_n2', 30002)
+        self.assertIn('queue num 30001', a)
+        self.assertIn('queue num 30002', b)
+        self.assertNotIn('18389', a)
+        self.assertNotIn('jack_ss_iplimit_n2', a)
+        self.assertNotIn('18388', b)
+
     def test_packet_source_v4_v6(self):
         v4 = bytes([0x45]) + bytes(11) + ipaddress.ip_address('192.0.2.1').packed + bytes(4)
         v6 = bytes([0x60]) + bytes(7) + ipaddress.ip_address('2001:db8::1').packed + bytes(16)

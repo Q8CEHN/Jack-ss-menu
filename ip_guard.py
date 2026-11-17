@@ -5,6 +5,7 @@ import collections
 import ipaddress
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -23,33 +24,33 @@ def nft(script):
                           capture_output=True, check=True, timeout=5)
 
 
-def rules(port, udp):
+def rules(port, udp, table=TABLE, queue=QUEUE):
     ports = [f"tcp sport {port}"]  # output responses to the node's clients
     if udp:
         ports.append(f"udp sport {port}")
     inputs = [p.replace("sport", "dport") for p in ports]
-    lines = [f"add table inet {TABLE}"]
+    lines = [f"add table inet {table}"]
     for family, kind in ((4, "ipv4_addr"), (6, "ipv6_addr")):
         for name, timeout in (("active", IDLE), ("banned", COOLDOWN)):
-            lines.append(f"add set inet {TABLE} {name}{family} "
+            lines.append(f"add set inet {table} {name}{family} "
                          f"{{ type {kind}; flags dynamic,timeout; timeout {timeout}s; size 65536; }}")
-    lines += [f"add chain inet {TABLE} input {{ type filter hook input priority -10; policy accept; }}",
-              f"add chain inet {TABLE} output {{ type filter hook output priority -10; policy accept; }}",
-              f"add chain inet {TABLE} admit"]
+    lines += [f"add chain inet {table} input {{ type filter hook input priority -10; policy accept; }}",
+              f"add chain inet {table} output {{ type filter hook output priority -10; policy accept; }}",
+              f"add chain inet {table} admit"]
     for p in inputs:
-        lines.append(f"add rule inet {TABLE} input {p} jump admit")
+        lines.append(f"add rule inet {table} input {p} jump admit")
     for version, proto in ((4, "ip"), (6, "ip6")):
-        lines.append(f"add rule inet {TABLE} admit {proto} saddr @banned{version} drop")
-        lines.append(f"add rule inet {TABLE} admit {proto} saddr @active{version} "
+        lines.append(f"add rule inet {table} admit {proto} saddr @banned{version} drop")
+        lines.append(f"add rule inet {table} admit {proto} saddr @active{version} "
                      f"update @active{version} {{ {proto} saddr timeout {IDLE}s }} return")
         for p in ports:
-            lines.append(f"add rule inet {TABLE} output {p} {proto} daddr @banned{version} drop")
-            lines.append(f"add rule inet {TABLE} output {p} {proto} daddr @active{version} "
+            lines.append(f"add rule inet {table} output {p} {proto} daddr @banned{version} drop")
+            lines.append(f"add rule inet {table} output {p} {proto} daddr @active{version} "
                          f"update @active{version} {{ {proto} daddr timeout {IDLE}s }} return")
     # No bypass: an unavailable controller must not silently remove the limit.
-    lines.append(f"add rule inet {TABLE} admit queue num {QUEUE}")
+    lines.append(f"add rule inet {table} admit queue num {queue}")
     for p in ports:
-        lines.append(f"add rule inet {TABLE} output {p} drop")
+        lines.append(f"add rule inet {table} output {p} drop")
     return "\n".join(lines) + "\n"
 
 
@@ -65,8 +66,9 @@ def packet_source(payload):
 
 
 class Admission:
-    def __init__(self, limit, port, status):
+    def __init__(self, limit, port, status, table=TABLE):
         self.limit, self.port, self.status = limit, port, Path(status)
+        self.table = table
         self.active = collections.OrderedDict()
         self.banned = {}
 
@@ -79,7 +81,7 @@ class Admission:
         tmp.replace(self.status)
 
     def sync(self):
-        data = subprocess.run(["nft", "-j", "list", "table", "inet", TABLE],
+        data = subprocess.run(["nft", "-j", "list", "table", "inet", self.table],
                               capture_output=True, text=True, check=True, timeout=5)
         live, banned = set(), set()
         for obj in json.loads(data.stdout)["nftables"]:
@@ -110,9 +112,9 @@ class Admission:
         script = []
         if victim:
             family = ipaddress.ip_address(victim).version
-            script += [f"delete element inet {TABLE} active{family} {{ {victim} }}",
-                       f"add element inet {TABLE} banned{family} {{ {victim} timeout {COOLDOWN}s }}"]
-        script.append(f"add element inet {TABLE} active{version} {{ {ip} timeout {IDLE}s }}")
+            script += [f"delete element inet {self.table} active{family} {{ {victim} }}",
+                       f"add element inet {self.table} banned{family} {{ {victim} timeout {COOLDOWN}s }}"]
+        script.append(f"add element inet {self.table} active{version} {{ {ip} timeout {IDLE}s }}")
         # One atomic kernel transaction: remove victim before accepting newcomer.
         nft("\n".join(script) + "\n")
         if victim:
@@ -135,14 +137,18 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--limit", type=int, required=True)
     parser.add_argument("--udp", action="store_true")
+    parser.add_argument("--table", default=TABLE)
+    parser.add_argument("--queue", type=int, default=QUEUE)
     parser.add_argument("--status", default="/run/jack-ss-iplimit/status.json")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 1 <= args.limit <= 4096:
         parser.error("invalid port or limit")
+    if not re.fullmatch(r"jack_ss_iplimit(?:_n[1-9][0-9]{0,4})?", args.table) or not 1 <= args.queue <= 65535:
+        parser.error("invalid node table or queue")
     from netfilterqueue import NetfilterQueue
     os.umask(0o077)
     Path(args.status).parent.mkdir(parents=True, exist_ok=True)
-    guard = Admission(args.limit, args.port, args.status)
+    guard = Admission(args.limit, args.port, args.status, args.table)
     queue = NetfilterQueue()
     running = True
     failed = False
@@ -165,7 +171,7 @@ def main():
             packet.drop()
 
     # Bind before installing packet rules; a queue conflict leaves other rules alone.
-    queue.bind(QUEUE, receive, max_len=4096)
+    queue.bind(args.queue, receive, max_len=4096)
     def stop(*_):
         nonlocal running
         running = False
@@ -173,9 +179,9 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     # Replace only our own named table. Keep an existing table on startup failure.
-    existing = subprocess.run(["nft", "list", "table", "inet", TABLE],
+    existing = subprocess.run(["nft", "list", "table", "inet", args.table],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    nft((f"delete table inet {TABLE}\n" if existing else "") + rules(args.port, args.udp))
+    nft((f"delete table inet {args.table}\n" if existing else "") + rules(args.port, args.udp, args.table, args.queue))
     guard.publish()
     # Type=notify starts the SS service only after the kernel rules are installed.
     notify = os.environ.get("NOTIFY_SOCKET")

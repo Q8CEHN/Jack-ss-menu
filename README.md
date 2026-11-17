@@ -1,87 +1,88 @@
-# Jack SS 轻量版
+# Jack SS 多节点版 3.0.0
 
-`shadowsocks-libev` + `s-s` 中文菜单，支持 NAT 小鸡。
+`shadowsocks-libev` + `s-s` 中文菜单。一台服务器可以新建多个 SS 节点，各自使用独立端口、密码、TCP/UDP 设置和 IP 上限。
 
-- C 内核，单个服务进程，默认仅 TCP，可选 TCP + UDP。
-- 默认不安装 Python、Docker、二维码工具，不下载或解压 sing-box。启用 IP 限制时会安装额外依赖。
-- Debian 13 amd64 实测：`ss-server` 文件约 147 KB；本地低负载 TCP / UDP 测试中进程 RSS 约 **2.3 MB**。这是单进程测量，系统、连接数和吞吐量会影响总占用。
-- 使用系统软件源安装内核与共享库；包索引、依赖和系统本身也需要空间。不能保证所有商家标称的“最小套餐”都满足条件。
+## 已安装 2.1.1：直接从菜单升级
 
-## 一键安装
+运行 `s-s`，选择 **9 → 1（更新菜单）**，显示 **3.0.0** 即升级完成。
+
+原有节点自动出现在节点列表中，名称显示为“原有节点”。原配置、端口、密码和正在运行的服务保留，无需重新创建或移动。升级菜单本身不重启节点。旧节点已经启用的 IP 上限也会保留，后续按选中节点独立管理。
+
+## 一键安装 / 更早版本升级
 
 root 登录后复制整行：
 
 ```sh
-sh -c 'set -e; if ! command -v bash >/dev/null || ! command -v curl >/dev/null; then if command -v apt-get >/dev/null; then apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true update && apt-get install -y --no-install-recommends bash curl ca-certificates; elif command -v apk >/dev/null; then apk add --no-cache bash curl ca-certificates; elif command -v dnf >/dev/null; then dnf install -y bash curl ca-certificates; elif command -v yum >/dev/null; then yum install -y bash curl ca-certificates; else exit 1; fi; fi; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; curl -fLSs --retry 2 "https://raw.githubusercontent.com/Q8CEHN/Jack-ss-menu/main/ss.sh?v=2.1.1" -o "$f"; bash "$f"'
+sh -c 'set -e; if ! command -v bash >/dev/null || ! command -v curl >/dev/null; then if command -v apt-get >/dev/null; then apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true update && apt-get install -y --no-install-recommends bash curl ca-certificates; elif command -v apk >/dev/null; then apk add --no-cache bash curl ca-certificates; elif command -v dnf >/dev/null; then dnf install -y bash curl ca-certificates; elif command -v yum >/dev/null; then yum install -y bash curl ca-certificates; else exit 1; fi; fi; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; curl -fLSs --retry 2 "https://raw.githubusercontent.com/Q8CEHN/Jack-ss-menu/main/ss.sh?v=3.0.0" -o "$f"; bash "$f"'
 ```
 
-看到 **2.1.1** 后，选择 **1. 安装 / 迁移**。
+首次使用选择 **1. 新建节点 / 旧版迁移**。以后输入 `s-s` 即可打开菜单。2.0.3 及更早版本的旧“9”不能更新菜单，需要先执行上面的命令一次。
 
-以后打开菜单：
+## 多节点怎么用
 
-```bash
-s-s
-```
+1. 选择 **1**，填写名称、端口、公网地址、是否启用 UDP 和密码；密码留空自动生成。
+2. 需要更多节点时，继续选择 **1**。每次创建新的独立节点，默认推荐空闲端口。
+3. 选择 **2**，查看节点列表并切换节点；选中后显示该节点参数和分享链接。
+4. 选择 **13**，设置**当前选中节点**的 IP 上限。例如节点 A 设置 2、节点 B 设置 5，两个节点分别计数。输入 `0` 关闭所选节点的限制。
+5. 选择 **14** 只删除当前节点；选择 **11** 输入 `YES` 才会卸载全部节点及本项目。
 
-## 安装填写
-
-端口只输入一次，同时用于服务监听和节点链接。默认 `8388`，可自行修改。
-
-接着填写公网 IP / 域名，并选择是否启用 UDP。
+主菜单顶部始终显示当前选中的节点。切换、新建、修改或删除节点均不更改其他节点的配置；不能给两个节点分配相同的本机端口。可建数量取决于可用端口、内存和系统资源；不是无限性能保证。
 
 ## 菜单
 
 | 编号 | 功能 |
 | --- | --- |
-| 1 | 安装 / 从旧版 sing-box 迁移 |
-| 2 | 查看参数与分享链接 |
-| 3 / 4 | 修改端口 / 密码 |
-| 5 / 6 / 7 | 启动 / 停止 / 重启 |
-| 8 / 9 | 查看日志 / 更新菜单或内核 |
-| 10 | 修改公网地址 |
-| 11 | 彻底卸载 |
-| 12 | TCP / UDP 设置 |
-| 13 | IP 数量限制：设置上限、查看 IP、清空顺序、关闭 |
+| 1 | 新建节点 / 从旧版 sing-box 迁移 |
+| 2 | 节点列表、切换节点、显示所选节点分享链接 |
+| 3 / 4 | 修改当前节点端口 / 密码 |
+| 5 / 6 / 7 | 启动 / 停止 / 重启当前节点 |
+| 8 | 查看当前节点日志 |
+| 9 → 1 | 在线更新菜单，不重启节点 |
+| 9 → 2 | 更新共享 SS 内核，重启当前正在运行的本项目节点 |
+| 10 | 修改当前节点公网地址 |
+| 11 | 卸载全部节点及本项目 |
+| 12 | 当前节点 TCP / UDP 设置 |
+| 13 | 当前节点 IP 上限、当前 IP、清空顺序、关闭限制 |
+| 14 | 删除当前节点，保留其他节点 |
+| 15 | 修改当前节点名称 |
 
-## 在线更新菜单（2.1.1）
+## 每个节点独立限制 IP
 
-新版菜单选择 **9 → 1**，在线更新菜单获得新功能，不用上传文件，不修改节点地址、端口和密码，也不重启节点。选择 **9 → 2** 更新 SS 内核。下载失败、脚本无效或远端版本更低时保留原菜单。
+- 每个节点拥有独立的上限、接入顺序、等待重连名单、防火墙表、队列和限制服务。关闭或清空 A 的限制不改变 B。
+- 按你指定的替换顺序：上限 2，A 先接入、B 后接入，C 接入后替换 B，保留 A 和 C；D 再接入时替换 C。已有 IP 新建连接不改变首次接入顺序。
+- 被替换的 IP 在 60 秒内不能重新接入，防止客户端自动重连反复互踢。60 秒后重试会按新 IP 处理，仍可替换该节点当前最后接入者。
+- 5 分钟双向无流量释放名额；这是流量活跃判断，不是精确的设备在线检测。重启该节点、修改限制或清空记录后，只重建该节点的接入顺序。
+- TCP / UDP 在同一节点内共用上限；IPv4 / IPv6 一起计数，但同一设备的两个地址算两个 IP。同公网 IP 的多台设备只计一个；同一 IP 访问两个节点时，分别进入两个节点的计数。
+- **按到达节点端口的来源流量计数，不是密码认证后的设备计数。** 扫描和错误密码连接也可能占名额或触发替换；当前内核不提供认证后的来源事件。
+- 新来源通过 NFQUEUE 接入，已准入来源由内核处理。只操作本项目独立 nftables 表，不清空整机规则。限制服务异常时拦截新来源；可从菜单关闭该节点限制恢复。
 
-旧版 2.0.3 的 9 只有更新内核功能，无法自行获取新版菜单；首次仍需重新执行上面的在线安装命令更新脚本，随后即可从菜单更新。在线更新需要新版代码已经发布到仓库。
+## 系统与资源
 
-## IP 数量限制（2.1.0）
+- 节点优先支持 Debian / Ubuntu；Alpine 使用 APK，CentOS / Rocky / AlmaLinux 需要软件源提供 `shadowsocks-libev`。不添加额外软件源或编译内核。
+- 节点支持 systemd、OpenRC、Debian SysV 开机启动。每个新节点一个服务进程；默认仅 TCP，可开启 UDP。
+- IP 限制支持 **Debian / Ubuntu + systemd**，需软件源提供 `python3-netfilterqueue`、`nftables`、`iproute2`，且内核支持 NFQUEUE / nftables，拥有 NET_ADMIN 权限。部分容器 / NAT 小机可能无法启用。
+- 默认关闭 IP 限制，未启用时不安装 Python 等限制组件。每个启用限制的节点额外运行一个 Python 控制进程；开启越多，资源占用越高。
+- 软件包全项目共用；删除一个节点不卸载共享内核。全部卸载时只清理本项目新增且可安全删除的包，保留其他软件正在依赖的包。安装防火墙工具时阻止其示例规则服务自动启动。
+- 在线更新会验证脚本标识、Bash 语法和版本号；下载失败、无效下载或远端版本更低时保留本机菜单。更新内核属于全项目操作，菜单里与更新脚本分别列出。
 
-运行 `s-s` → **13. IP 数量限制** → **1. 设置 / 修改上限**，输入人数上限，输入 `0` 关闭。默认关闭，不更改原节点密码或地址。已安装用户重新执行上面的一键命令即可更新菜单。
+## 数据与服务
 
-采用你指定的替换顺序：上限为 2 时，A 先接入、B 后接入，C 接入后替换 B，保留 A 和 C；D 再接入时替换 C。已有 IP 新建连接不会改变首次接入顺序。
+- 原有节点继续保存在 `/etc/jack-ss/`，服务名仍为 `jack-ss`，不自动改动原密码或端口。
+- 新节点分别保存在 `/etc/jack-ss/nodes/编号/`，服务为 `jack-ss-node-编号`。节点目录和凭据仅 root 可读。
+- 安装包归属记录位于 `/etc/jack-ss/`，不随单节点删除而移除。节点资料各自保存在其目录的 `node.txt`。
+- 命令行指定新节点：`s-s --node 1 --start` / `--stop` / `--restart`。原有节点使用 `s-s --node legacy --start`。
+- NAT 环境仍需商家预先映射 / 放行对应端口；节点限制使用本机监听端口作为隔离范围。
 
-- TCP 和 UDP 共用一个 IP 上限，IPv4 / IPv6 合并计算，但同一设备的 IPv4 和 IPv6 算两个来源。服务器只能看到 NAT 后的公网 IP，同公网 IP 的多台设备只计一个。
-- 被替换的 IP 在 60 秒内不能重新接入，防止自动重连反复互踢；60 秒后它作为新 IP 重试时，仍可替换当前最后接入者。5 分钟双向无流量释放名额；这不是精确的设备在线检测。
-- **按到达本机节点端口的来源流量计数，不是 SS 密码认证后的账号/设备计数。** 扫描或错误密码连接也可能占用名额、触发替换；当前内核不提供认证后的来源事件。
-- 使用独立 nftables 表，只限制本节点本机监听端口，保留主机其他防火墙规则。新来源经 NFQUEUE 决定是否接入，已接入来源由内核处理流量。限制服务异常时对新来源保持拦截，重启失败可从菜单关闭限制恢复。
-- 当前 IP 限制支持 **Debian / Ubuntu + systemd**，且系统软件源需提供 `python3-netfilterqueue`、`nftables`、`iproute2`。不满足条件时显示错误，不启用限制；主菜单其他功能仍可用。无 NET_ADMIN、缺少 NFQUEUE / nftables 内核支持的容器或 NAT 小机可能无法启用。
-- 额外运行一个 Python 控制进程，仅启用时安装依赖、启动服务；不开启时保持原来的轻量节点。开机随节点恢复限制；重启节点、修改限制或清空记录后，接入顺序按新流量重建。菜单能查看当前顺序与等待重连 IP。
-- 关闭限制会移除本项目规则与限制服务；彻底卸载还会按安装记录清理本项目新增的软件包，包管理器判断被其他软件依赖的包会保留。
+## 验证
 
-## 支持与升级
+- 26 项自动化测试通过：多节点创建、独立密码 / 协议 / 服务、独立 IP 限制与替换顺序、单节点修改 / 关闭限制 / 删除时保留其他节点、端口冲突、旧节点原地保留、全部卸载、在线更新失败保留旧版本。
+- 两个实际 `shadowsocks-libev` 节点在本地完成 TCP 和 UDP 转发测试，停止其中一个后另一个仍可转发。使用菜单真实配置生成功能，所有流量均在本机回环地址。
+- 开发环境没有 NET_ADMIN；真实内核 nftables / NFQUEUE 限流、systemd / OpenRC / SysV 开机恢复仍需在目标 VPS 验证。IP 限制目前通过逻辑及配置隔离模拟验证，不声称已完成实机限流验证。
 
-- 优先支持 Debian / Ubuntu；Alpine 使用 APK，CentOS / Rocky / AlmaLinux 需要现有软件源提供 `shadowsocks-libev`。不自动添加额外仓库或编译源码。
-- 支持 systemd、OpenRC 和 Debian SysV 开机启动。其他初始化环境可用 `s-s --start`，需自行添加启动任务。
-- 密码和配置在 `/etc/jack-ss/`，仅 root 可读；资料在 `/etc/jack-ss/node.txt`。
-- 原 1.x 用户重新执行安装命令，选择 1 迁移，保留本项目的端口、密码和加密方式；确认新服务运行后删除本项目旧的大内核。失败时恢复旧配置和服务。
-- 卸载会删除节点、密码、迁移备份、旧私有内核、服务、自启链接、新旧菜单命令和本项目防火墙规则，同时移除未共享的 shadowsocks-libev 软件包。新安装会记录新增依赖，仅清理其中已无软件依赖的包；旧版使用受限的 libev 依赖名单。已有共享内核、其他节点及其他软件仍在使用的依赖会保留。
-- 防火墙自动处理限运行中的 UFW / firewalld，其他规则需自行设置。
-
-## 彻底卸载
-
-菜单选择 **11**，输入 `YES`。旧菜单已被删除时，也可直接下载新版执行卸载：
-
-```bash
-f=$(mktemp); curl -fLSs 'https://raw.githubusercontent.com/Q8CEHN/Jack-ss-menu/main/ss.sh?v=2.1.1' -o "$f" && bash "$f" --uninstall; rm -f "$f"; hash -r
+```sh
+python3 -m unittest -v test_ip_guard.py test_update.py test_multinode.py
+# 如已安装实际内核，可额外验证本机 TCP/UDP：
+SS_CORE_BIN_DIR=/usr/bin python3 -m unittest -v test_native.py
 ```
 
-## 已验证
-
-Bash 语法、密码转义与分享链接、公网/本机端口分离、TCP / UDP 实际转发、修改失败回滚。systemd / OpenRC / SysV 的开机启动仍需在目标 VPS 上验证。2.1.0 的 IP 替换顺序、重连等待、空闲释放、IPv4 / IPv6 合并及失败时保留旧状态已通过自动化模拟测试；当前开发环境无 NET_ADMIN，尚未完成真实内核 TCP / UDP 限流与 systemd 开机恢复测试。
-
-参考：[Debian 官方软件包](https://packages.debian.org/trixie/shadowsocks-libev) · [ss-server 手册](https://manpages.debian.org/trixie/shadowsocks-libev/ss-server.1.en.html)
+参考：[Debian 软件包](https://packages.debian.org/trixie/shadowsocks-libev) · [ss-server 手册](https://manpages.debian.org/trixie/shadowsocks-libev/ss-server.1.en.html) · [nftables 集合与超时](https://wiki.nftables.org/wiki-nftables/index.php/Updating_sets_from_the_packet_path)
